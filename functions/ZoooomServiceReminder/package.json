@@ -1,0 +1,15 @@
+{
+  "name": "zoooom-service-reminder",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ZoooomServiceReminder — daily maintenance-reminder sweep (OEM MMYT schedule matching + prediction).",
+  "main": "index.mjs",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "@aws-sdk/client-lambda": "^3.600.0"
+  }
+}

@@ -34,6 +34,13 @@
       "purpose": "Manual service-record add. On success invokes SERVICE_REMINDER_FN {vin,userId}."
     },
     {
+      "name": "ZoooomDealOffer",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": { "Dev": "$LATEST", "Staging": "14", "Prod": "14" },
+      "purpose": "Deal/offer CRUD (POST /offers, /deals, GET /deals/{id}/offers, accept/counter/decline). putDeal strips empty GSI-key attrs (vin/sellerId/buyerId) so empty-vin offers don't 500 on VinIndex."
+    },
+    {
       "name": "ZoooomMessagingV3",
       "handler": "index.handler",
       "runtime": "nodejs22.x",

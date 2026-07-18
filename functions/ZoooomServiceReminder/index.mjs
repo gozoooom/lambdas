@@ -18,8 +18,9 @@
  * The notifier owns the opt-in gate (reuses the "Service Notifications" preference)
  * and the email/inbox send. This lambda only decides WHAT is due.
  *
- * Per-env config is env-driven (one deployment per env, like the other lambdas):
- * VEHICLES_TABLE / SERVICE_RECORDS_TABLE / NOTIFICATION_FN default to _dev.
+ * Per-env config is resolved from the INVOKED ALIAS qualifier at runtime (Dev/
+ * Staging/Prod → _dev/_staging/_prod tables + same-env ZoooomOfferNotification
+ * alias). One published version serves all envs; $LATEST = dev.
  */
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -35,20 +36,41 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 });
 const lambda = new LambdaClient({ region: REGION });
 
-const VEHICLES_TABLE = process.env.VEHICLES_TABLE || "ZoooomVehicle_dev";
-const SERVICE_RECORDS_TABLE = process.env.SERVICE_RECORDS_TABLE || "ZoooomServiceRecord_dev";
 const SERVICE_RECORDS_INDEX = process.env.SERVICE_RECORDS_INDEX || "vehicleId-index";
-const NOTIFICATION_FN = process.env.NOTIFICATION_FN || "ZoooomOfferNotification";
 const REMIND_WITHIN_DAYS = Number(process.env.REMIND_WITHIN_DAYS || "7");
 // Don't re-nudge on items that have been overdue for ages (stale/mismatched data).
 const OVERDUE_GRACE_DAYS = Number(process.env.OVERDUE_GRACE_DAYS || "45");
+
+// ── per-env resolution via the invoked alias qualifier ──────────────────────
+// One published version serves all envs: EventBridge/callers invoke the Dev,
+// Staging or Prod alias and we resolve tables + the downstream notifier to the
+// matching env at runtime (same pattern as ZoooomOfferNotification/DealOffer).
+// $LATEST (no qualifier) = dev. NEVER point a prod/staging alias at $LATEST.
+let currentQualifier; // 'Staging' | 'Prod' | undefined ($LATEST → dev)
+const SUFFIX_BY_QUALIFIER = { Staging: "_staging", staging: "_staging", Prod: "_prod", prod: "_prod" };
+function tableSuffix() { return SUFFIX_BY_QUALIFIER[currentQualifier] || "_dev"; }
+function vehiclesTable() { return `ZoooomVehicle${tableSuffix()}`; }
+function serviceRecordsTable() { return `ZoooomServiceRecord${tableSuffix()}`; }
+// Invoke the SAME-env notifier alias so its inbox/email use the matching env
+// tables. Dev ($LATEST) → unqualified ZoooomOfferNotification (its $LATEST=dev).
+// NOTE: ZoooomOfferNotification's env aliases are LOWERCASE (staging/prod), so we
+// lowercase the qualifier here regardless of our own alias casing.
+function notificationFn() {
+  if (!currentQualifier) return "ZoooomOfferNotification";
+  return `ZoooomOfferNotification:${currentQualifier.toLowerCase()}`;
+}
+function parseQualifierFromArn(arn) {
+  if (!arn) return undefined;
+  const parts = arn.split(":");
+  return parts.length >= 8 ? parts[7] : undefined; // ...:function:Name:QUALIFIER
+}
 
 const nowIso = () => new Date().toISOString();
 
 async function getServiceHistory(vin) {
   try {
     const r = await ddb.send(new QueryCommand({
-      TableName: SERVICE_RECORDS_TABLE,
+      TableName: serviceRecordsTable(),
       IndexName: SERVICE_RECORDS_INDEX,
       KeyConditionExpression: "vehicleId = :v",
       ExpressionAttributeValues: { ":v": vin },
@@ -63,7 +85,7 @@ async function getServiceHistory(vin) {
 async function notify(payload) {
   try {
     await lambda.send(new InvokeCommand({
-      FunctionName: NOTIFICATION_FN,
+      FunctionName: notificationFn(),
       InvocationType: "Event",
       Payload: Buffer.from(JSON.stringify(payload)),
     }));
@@ -98,7 +120,7 @@ async function processVehicle(v, { asOf } = {}) {
 
   // Persist next-service fields (or clear them when nothing is predictable).
   await ddb.send(new UpdateCommand({
-    TableName: VEHICLES_TABLE,
+    TableName: vehiclesTable(),
     Key: { vin, userId },
     UpdateExpression: next
       ? "SET nextServiceDate = :d, nextServiceMile = :m, nextServiceItem = :i, milesPerDayEst = :mpd, scheduleUpdatedAt = :ts"
@@ -140,7 +162,7 @@ async function processVehicle(v, { asOf } = {}) {
   // is still delivered, and we don't want to re-attempt the same cycle daily).
   if (sent) {
     await ddb.send(new UpdateCommand({
-      TableName: VEHICLES_TABLE,
+      TableName: vehiclesTable(),
       Key: { vin, userId },
       UpdateExpression: "SET lastServiceReminderKey = :k, lastServiceReminderAt = :ts",
       ExpressionAttributeValues: { ":k": reminderKey, ":ts": nowIso() },
@@ -155,7 +177,7 @@ async function sweep({ asOf } = {}) {
   const results = [];
   do {
     const r = await ddb.send(new ScanCommand({
-      TableName: VEHICLES_TABLE,
+      TableName: vehiclesTable(),
       ExclusiveStartKey: lastKey,
     }));
     const items = r.Items || [];
@@ -176,7 +198,11 @@ async function sweep({ asOf } = {}) {
   return { scanned, reminded, results };
 }
 
-export const handler = async (event = {}) => {
+export const handler = async (event = {}, context) => {
+  // Resolve env (tables + downstream notifier) from the invoked alias.
+  currentQualifier = parseQualifierFromArn(context?.invokedFunctionArn);
+  console.log(`[ServiceReminder] qualifier=${currentQualifier || "$LATEST(dev)"} tables=${vehiclesTable()}/${serviceRecordsTable()} notifier=${notificationFn()}`);
+
   const isSchedule =
     event?.task === "service_reminder_sweep" ||
     event?.["detail-type"] === "Scheduled Event" ||
@@ -189,7 +215,7 @@ export const handler = async (event = {}) => {
     let row = null;
     try {
       const r = await ddb.send(new GetCommand({
-        TableName: VEHICLES_TABLE, Key: { vin: event.vin, userId: event.userId },
+        TableName: vehiclesTable(), Key: { vin: event.vin, userId: event.userId },
       }));
       row = r.Item || null;
     } catch (e) { console.warn("[handler] getVehicle failed:", e?.message); }

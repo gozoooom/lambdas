@@ -148,6 +148,25 @@ published, so set the right tables/keys on that version.
 Functions with **no aliases** (single shared version, e.g. AI/parse utilities) are invoked
 **unqualified on all gateways** — that's fine and intentional; document it in `manifest.json`.
 
+### 4a. Intentionally SHARED (single-env) functions — do NOT split per env
+
+Some functions are **deliberately one function + one table + one endpoint for all environments**,
+because the data is environment-independent and shared caching benefits every env. Examples:
+- **License-plate → VIN decode** (`ZoooomParseLicensePlate` / plate lookup)
+- **Advanced VIN decode** (`ZoooomVINDecodeVDB` / VIN spec cache) — one decode per VIN, cached once
+- Read-only reference/AI utilities (`ZoooomDocAI`, `ZoooomReasoningHandler`, `VehicleRecall`,
+  `ZoooomVerifyDocument`, `ZoooomGetCatalog*`, `ZoooomListingAI`)
+
+Rules for shared functions:
+- **One table, one deployment, no per-env alias.** All env gateways route to the **same unqualified**
+  function. All three Amplify branches (dev/staging/prod) may point the corresponding endpoint var at
+  the **same** gateway/URL — that is CORRECT, not a leak.
+- Mark them `"shared": true` in `manifest.json` so the audit and this runbook don't flag them for
+  per-env splitting. When auditing "does each env's endpoint exist," a shared endpoint legitimately
+  resolves to one gateway across all envs.
+- Decision test: **is the data env-specific?** VIN/plate decodes, recall data, OEM catalogs → NO →
+  share. Deals/offers/users/KYC/service-records/reports → YES → split per env (`_dev/_staging/_prod`).
+
 ---
 
 ## 5. Pre-flight verification checklist (run before calling a change "done")

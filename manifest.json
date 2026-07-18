@@ -6,45 +6,73 @@
       "name": "ZoooomOfferNotification",
       "handler": "index.handler",
       "runtime": "nodejs24.x",
-      "aliases": { "dev": "$LATEST", "Staging": "published", "Prod": "published" },
+      "aliases": {
+        "dev": "$LATEST",
+        "Staging": "published",
+        "Prod": "published"
+      },
       "purpose": "Inbox + SES notifier. Direct {eventType} dispatch: OFFER_*/PAYMENT_*/SALE_*/CONFIRM_SALE_REQUEST/LISTING_WITHDRAWN/SERVICE_REMINDER. Per-env via alias qualifier."
     },
     {
       "name": "ZoooomServiceReminder",
       "handler": "index.handler",
       "runtime": "nodejs22.x",
-      "aliases": { "dev": "$LATEST" },
-      "eventbridge": "ZoooomServiceReminderDaily cron(0 15 * * ? *) -> {task:'service_reminder_sweep'}",
-      "purpose": "Daily maintenance-reminder sweep + ad-hoc {vin,userId} recompute. OEM MMYT schedule match/predict (min of miles|months). Invokes ZoooomOfferNotification SERVICE_REMINDER."
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "published",
+        "Prod": "published"
+      },
+      "eventbridge": "ZoooomServiceReminderDaily{,-Staging,-Prod} cron(0 15) -> :Dev($LATEST)/:Staging/:Prod",
+      "purpose": "Daily maintenance sweep + ad-hoc {vin,userId}. QUALIFIER-BASED (resolves _dev/_staging/_prod + same-env ZoooomOfferNotification alias from invoked qualifier). One version serves all envs."
     },
     {
       "name": "ZoooomAddServiceRecord",
       "handler": "index.handler",
       "runtime": "nodejs24.x",
-      "aliases": { "Dev": "$LATEST", "Staging": "24", "Prod": "25" },
-      "env": { "SERVICE_REMINDER_FN": "ZoooomServiceReminder (dev only)" },
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "24",
+        "Prod": "25"
+      },
+      "env": {
+        "SERVICE_REMINDER_FN": "ZoooomServiceReminder (dev only)"
+      },
       "purpose": "Scanned service-record add (+dedup). On success invokes SERVICE_REMINDER_FN {vin,userId} for instant schedule refresh."
     },
     {
       "name": "ZoooomAddServiceRecordManual",
       "handler": "index.handler",
       "runtime": "nodejs24.x",
-      "aliases": { "Dev": "$LATEST", "Staging": "published", "Prod": "published" },
-      "env": { "SERVICE_REMINDER_FN": "ZoooomServiceReminder (dev only)" },
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "published",
+        "Prod": "published"
+      },
+      "env": {
+        "SERVICE_REMINDER_FN": "ZoooomServiceReminder (dev only)"
+      },
       "purpose": "Manual service-record add. On success invokes SERVICE_REMINDER_FN {vin,userId}."
     },
     {
       "name": "ZoooomDealOffer",
       "handler": "index.handler",
       "runtime": "nodejs22.x",
-      "aliases": { "Dev": "$LATEST", "Staging": "14", "Prod": "14" },
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "14",
+        "Prod": "14"
+      },
       "purpose": "Deal/offer CRUD (POST /offers, /deals, GET /deals/{id}/offers, accept/counter/decline). putDeal strips empty GSI-key attrs (vin/sellerId/buyerId) so empty-vin offers don't 500 on VinIndex."
     },
     {
       "name": "ZoooomMessagingV3",
       "handler": "index.handler",
       "runtime": "nodejs22.x",
-      "aliases": { "dev": "$LATEST", "staging": "17", "prod": "18" },
+      "aliases": {
+        "dev": "$LATEST",
+        "staging": "17",
+        "prod": "18"
+      },
       "purpose": "Inbox/chat + notification prefs. set_prefs/get_prefs write/read notificationPreferences on ZoooomUser (composite IdUser+email). Origin allowlist enforced."
     }
   ]

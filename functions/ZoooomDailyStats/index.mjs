@@ -38,6 +38,15 @@ const AUTH_FN = process.env.AUTH_FUNCTION_NAME || "ZoooomAuthAllDomain";
 const AUTH_LOG_GROUP = process.env.AUTH_LOG_GROUP || "/aws/lambda/ZoooomAuthAllDomain";
 const TZ = "America/Los_Angeles";
 
+/**
+ * PT date the `createdAt` fix went live on ZoooomAddVehicleDynamoDB:Prod (v38).
+ * Vehicles added before this have no createdAt and never will — we don't know
+ * their true add date, and back-stamping would report old cars as added today.
+ * So the digest keeps using the invocation proxy until the whole 14-day window
+ * sits after the cutover, then switches to the exact table count automatically.
+ */
+const GARAGE_CREATEDAT_SINCE = "2026-07-20";
+
 const ddb = new DynamoDBClient({ region: REGION });
 const logs = new CloudWatchLogsClient({ region: REGION });
 const cw = new CloudWatchClient({ region: REGION });
@@ -271,7 +280,7 @@ export const handler = async (event = {}) => {
   const endMs = Date.now();
   const startMs = endMs - 15 * 86400000; // 15d covers the full 14-day PT window
 
-  const [users, listings, offers, deals, reportUsage, inspections, logins, garageAdds] =
+  const [users, listings, offers, deals, reportUsage, inspections, logins, garageAdds, vehicles] =
     await Promise.all([
       scanAll("ZoooomUser_prod", "IdUser, createdAt"),
       scanAll("ZoooomVehicleListing_prod", "createdAt"),
@@ -287,7 +296,17 @@ export const handler = async (event = {}) => {
         console.warn("garage adds failed:", e?.name || e);
         return null;
       }),
+      scanAll("ZoooomVehicle_prod", "createdAt"),
     ]);
+
+  // Switch garage adds from the invocation proxy to the exact table count once
+  // the whole reporting window post-dates the createdAt fix (see the constant).
+  const garageAddsFromTable = days[days.length - 1] >= GARAGE_CREATEDAT_SINCE;
+  const garageAddsRollup = garageAddsFromTable
+    ? rollup(countByDay(vehicles, "createdAt"), days)
+    : garageAdds
+      ? rollup(garageAdds, days)
+      : null;
 
   const signupsByDay = countByDay(users, "createdAt");
 
@@ -333,8 +352,10 @@ export const handler = async (event = {}) => {
     { section: "Supply" },
     {
       label: "Cars added to garage",
-      value: garageAdds ? rollup(garageAdds, days) : null,
-      note: "proxy: AddVehicle:Prod invocations (table has no createdAt)",
+      value: garageAddsRollup,
+      note: garageAddsFromTable
+        ? null
+        : `proxy: AddVehicle:Prod invocations until ${GARAGE_CREATEDAT_SINCE} (pre-fix rows have no createdAt)`,
     },
     { label: "Cars listed", value: rollup(countByDay(listings, "createdAt"), days) },
     { section: "Demand" },

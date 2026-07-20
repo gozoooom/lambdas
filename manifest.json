@@ -90,6 +90,22 @@
         "AUTH_LOG_GROUP": "/aws/lambda/ZoooomAuthAllDomain"
       },
       "purpose": "Daily prod metrics digest to Slack: signups, returning logins, reports run, AI inspections, garage adds, listings, offers made/accepted, cars sold. Each as yesterday / 7d rolling / WoW. PT day buckets. PROD-ONLY (no env switch by design): _prod tables + :Prod alias filters on logs and CloudWatch. Invoke {dryRun:true} to preview without posting."
+    },
+    {
+      "name": "ZoooomAddVehicleDynamoDB",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "37",
+        "Prod": "38"
+      },
+      "env": {
+        "VITE_AWS_VEHICLE_TABLE": "ZoooomVehicle_{dev,staging,prod}",
+        "VITE_AWS_USER_TABLE": "ZoooomUser_{dev,staging,prod}"
+      },
+      "purpose": "Adds/re-lists a vehicle in the user's garage. Writes createdAt/updatedAt (new add + archived re-add); active re-list PRESERVES createdAt. ZoooomDailyStats counts garage adds off createdAt.",
+      "warning": "ENV VARS ARE BAKED INTO PUBLISHED VERSIONS. Never publish from $LATEST and point Prod at it \u2014 that ships DEV table names to prod. Promote by: set $LATEST env to target-env values -> publish -> move alias -> restore $LATEST to dev. Code defaults in index.mjs are _prod (NOT dev-safe) so a missing env var silently hits prod."
     }
   ]
 }

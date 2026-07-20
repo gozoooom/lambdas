@@ -1,0 +1,7 @@
+{
+  "name": "zoooom-report-intent",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ZoooomReportIntent — first-report intent capture (buy/sell/own/curious + timeframe) append-only analytics sink.",
+  "main": "index.mjs"
+}

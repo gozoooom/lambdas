@@ -211,3 +211,47 @@ offer split-brain immediately.
   repointing `Dev`→`$LATEST`. 40 functions have `Prod`/`Staging` aliases but no `Dev` alias
   (they run `$LATEST` on the dev gw = dev, fine, but inconsistent). `VITE_STRIPE_OPS_URL` uses
   lowercase `/dev` stage (works; casing differs from `/Dev`).
+
+---
+
+## Lambda promotion — env vars are baked into versions
+
+**Rule: every environment gets its OWN published version. Never point two aliases
+at one version.** Lambda freezes environment variables into a published version, so
+one version cannot carry both `_dev` and `_prod` table names.
+
+**The failure mode (happened 2026-07-20, `ZoooomAddVehicleDynamoDB`):** publishing a
+version straight off `$LATEST` and pointing `Prod` at it ships **dev** table names to
+prod — prod then silently reads/writes `_dev` tables. Nothing errors: the publish
+succeeds, the alias moves, CloudWatch is clean. The only symptom is prod traffic
+hitting dev data. Caught in ~40s; `Invocations` on the `Resource=<fn>:Prod` dimension
+confirmed zero invokes in the window, so nothing was misrouted — but only because the
+function is low-traffic.
+
+**Always promote with the script — it cannot make this mistake:**
+
+    ./lib/promote.sh <FunctionName> <Staging|Prod>
+
+It takes the target alias's existing env as the source of truth (never guesses table
+names), swaps `$LATEST` env → publishes → moves the alias → restores `$LATEST` to dev
+via an EXIT trap, then runs a parity gate. It refuses outright if the target alias is
+already cross-wired.
+
+**Audit the whole fleet any time (exits non-zero on mismatch, so it can gate a release):**
+
+    ./lib/audit-env.sh                 # all Zoooom* functions
+    ./lib/audit-env.sh ZoooomFoo       # one function
+
+`ZoooomServiceReminder` is the one legitimate exception — it resolves per-env config
+from the invoked alias qualifier at runtime, so its baked env vars are vestigial and
+intentionally look like dev. It is allow-listed in `audit-env.sh`.
+
+**Known open mismatch:** `ZoooomInternalFraudReview:staging` has
+`VITE_AWS_USER_TABLE=ZoooomUser_prod` (since 2026-05-07). It both reads flagged users
+and **writes** review decisions (`isFraud`, `reviewNote`) — so staging fraud-review
+actions mutate PROD user rows. Left as-is pending a decision on whether internal
+reviewers are meant to work against prod data.
+
+**Also fix eventually:** several handlers default to `_prod` table names when an env
+var is unset (e.g. `ZoooomAddVehicleDynamoDB`). Per §1 every app-level default must be
+**dev-safe**; a missing var should fail into dev, never prod.

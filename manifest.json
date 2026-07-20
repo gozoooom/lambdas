@@ -74,6 +74,22 @@
         "prod": "18"
       },
       "purpose": "Inbox/chat + notification prefs. set_prefs/get_prefs write/read notificationPreferences on ZoooomUser (composite IdUser+email). Origin allowlist enforced."
+    },
+    {
+      "name": "ZoooomDailyStats",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "(none)": "$LATEST \u2014 standalone monitor, prod-only by design"
+      },
+      "eventbridge": "ZoooomDailyStatsDaily cron(0 15 * * ? *) -> $LATEST (08:00 PDT / 07:00 PST)",
+      "env": {
+        "DAILY_STATS_CHANNEL": "C0BJM87CQ8H (#daily-stats)",
+        "SLACK_SECRET_ID": "zoooom/slack/support-bot",
+        "AUTH_FUNCTION_NAME": "ZoooomAuthAllDomain",
+        "AUTH_LOG_GROUP": "/aws/lambda/ZoooomAuthAllDomain"
+      },
+      "purpose": "Daily prod metrics digest to Slack: signups, returning logins, reports run, AI inspections, garage adds, listings, offers made/accepted, cars sold. Each as yesterday / 7d rolling / WoW. PT day buckets. PROD-ONLY (no env switch by design): _prod tables + :Prod alias filters on logs and CloudWatch. Invoke {dryRun:true} to preview without posting."
     }
   ]
 }

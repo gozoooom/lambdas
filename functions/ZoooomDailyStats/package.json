@@ -1,0 +1,7 @@
+{
+  "name": "zoooom-daily-stats",
+  "version": "1.0.0",
+  "description": "Daily prod product-metrics digest (signups, logins, reports, listings, offers, sales) posted to Slack #daily-stats",
+  "type": "module",
+  "main": "index.mjs"
+}

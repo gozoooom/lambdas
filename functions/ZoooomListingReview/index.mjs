@@ -34,7 +34,19 @@ import { unmarshall } from "@aws-sdk/util-dynamodb";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 
 const REGION = process.env.AWS_REGION || "us-west-2";
+/**
+ * One channel per queue — the team has a dedicated channel for each, and
+ * routing everything into one defeats the point of having them. A queue with
+ * no channel configured logs instead of posting, so nothing lands in the wrong
+ * place just because a variable is missing.
+ */
 const CHANNEL = process.env.LISTING_REVIEW_CHANNEL || "";
+const CHANNEL_BY_QUEUE = {
+  kyc: process.env.LISTING_REVIEW_CHANNEL || "",
+  fraud: process.env.OWNERSHIP_REVIEW_CHANNEL || "",
+  moderation: process.env.PHOTO_REVIEW_CHANNEL || process.env.LISTING_REVIEW_CHANNEL || "",
+};
+const channelFor = (queue) => CHANNEL_BY_QUEUE[queue] || CHANNEL;
 const SLACK_SECRET_ID = process.env.SLACK_SECRET_ID || "zoooom/slack/support-bot";
 const DASHBOARD_URL = process.env.REVIEW_DASHBOARD_URL || "";
 const POST_WHEN_EMPTY = (process.env.POST_WHEN_EMPTY || "true") !== "false";
@@ -225,9 +237,9 @@ function renderAlert(item) {
   return `⚠️ *${titles[item.kind] || "Needs review"}*\n*Who:* ${item.who}${vin}\n*Why:* ${item.why}${link(item.id)}`;
 }
 
-async function postSlack(text) {
-  if (!CHANNEL) {
-    console.warn("no LISTING_REVIEW_CHANNEL set — not posting. Would have sent:\n" + text);
+async function postSlack(text, channel = CHANNEL) {
+  if (!channel) {
+    console.warn("no channel configured for this post — not sending. Would have sent:\n" + text);
     return { ok: false, reason: "no_channel", preview: text };
   }
   const sec = await sm.send(new GetSecretValueCommand({ SecretId: SLACK_SECRET_ID }));
@@ -242,7 +254,7 @@ async function postSlack(text) {
       "Content-Type": "application/json; charset=utf-8",
       Authorization: `Bearer ${creds.botToken}`,
     },
-    body: JSON.stringify({ channel: CHANNEL, text, unfurl_links: false }),
+    body: JSON.stringify({ channel, text, unfurl_links: false }),
   });
   const j = await r.json();
   if (!j.ok) console.warn("Slack post failed:", j.error);
@@ -306,7 +318,7 @@ export const handler = async (event = {}) => {
       // One failed post must not poison the batch — a thrown error would make
       // Lambda retry the whole shard and re-alert everything that did succeed.
       try {
-        const res = await postSlack(renderAlert(item));
+        const res = await postSlack(renderAlert(item), channelFor(item.kind));
         if (res.ok) posted++;
       } catch (e) {
         console.error("alert post failed for", item.kind, item.id, e);

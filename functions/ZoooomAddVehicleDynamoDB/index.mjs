@@ -13,6 +13,66 @@ const ddb = new DynamoDBClient({ region: REGION });
 const docClient = DynamoDBDocumentClient.from(ddb);
 let VEHICLE_TABLE = process.env.VITE_AWS_VEHICLE_TABLE || "ZoooomVehicle_prod";
 let USER_TABLE = process.env.VITE_AWS_USER_TABLE || "ZoooomUser_prod";
+// Gold-standard intrinsic specs come from the VDB MMYT catalog (cross-env),
+// NOT from the raw client-built specs (which read the wrong VDB field and label
+// hybrids "Gasoline"). We overlay the normalized VEHICLE section onto whatever
+// specs the client sent, keyed by the decoded make/year/model/trim.
+const MMYT_SPEC_TABLE = process.env.MMYT_SPEC_TABLE || "ZoooomMMYTSpec";
+
+/** GetItem the normalized VEHICLE section for a decoded MMYT. Returns its `data`
+ *  map (fuel_type, drive_type, mpg_*, transmission_type, body_type, …) or null. */
+async function getMmytVehicle({ year, make, model, trim }) {
+  if (!year || !make || !model || !trim) return null;
+  const PK = `MMYT:${year}#${make}#${model}#${trim}`;
+  try {
+    const r = await docClient.send(new GetCommand({
+      TableName: MMYT_SPEC_TABLE, Key: { PK, SK: "VEHICLE" },
+    }));
+    return r?.Item?.data || null;
+  } catch (e) {
+    console.warn("MMYT VEHICLE lookup failed:", PK, e.message);
+    return null;
+  }
+}
+
+/** Overlay the authoritative normalized MMYT fields onto a specs object,
+ *  creating nested sections as needed. Only overwrites when MMYT has a value,
+ *  so client-supplied detail (dimensions/weights/brakes/etc.) is preserved. */
+// MMYT's fuel_type CATEGORY is authoritative (Gas|Hybrid|Electric|Plug-in
+// Hybrid). Keep the conventional "Gasoline" label for the Gas category (used
+// everywhere else in the system) so only genuine corrections (hybrids/EVs) change.
+const fuelLabelFor = (ft) => (ft === "Gas" ? "Gasoline" : ft);
+
+function overlayMmytSpecs(specs, v) {
+  if (!v) return specs;
+  const out = specs && typeof specs === "object" ? { ...specs } : {};
+  const set = (obj, key, val) => { if (val != null && val !== "") obj[key] = val; };
+  out.overview = { ...(out.overview || {}) };
+  out.engine = { ...(out.engine || {}) };
+  out.performance = { ...(out.performance || {}) };
+  out.seating = { ...(out.seating || {}) };
+  set(out.engine, "fuelType", fuelLabelFor(v.fuel_type)); // Hybrid/Electric fix; Gas→Gasoline
+  set(out.engine, "type", v.engine_type_raw);
+  set(out.engine, "horsepower", v.system_net_power);
+  set(out.performance, "drivetype", v.drive_type);
+  set(out.performance, "mpgCity", v.mpg_city);
+  set(out.performance, "mpgHighway", v.mpg_highway);
+  set(out.performance, "mpgCombined", v.mpg_combined);
+  set(out.overview, "bodyType", v.body_type);
+  set(out.overview, "doors", v.doors);
+  set(out.overview, "epaClass", v.epa_classification);
+  set(out.seating, "total", v.seating_capacity);
+  if (v.transmission_type) out.transmission = v.transmission_type;
+  return out;
+}
+
+/** Resolve the specs to persist: client specs (or stored, on re-list) with the
+ *  authoritative MMYT normalized fields overlaid on top. */
+async function canonicalSpecs({ year, make, model, trim, specs }) {
+  const v = await getMmytVehicle({ year, make, model, trim });
+  if (!v) return specs ?? null;            // catalog miss → keep what we had
+  return overlayMmytSpecs(specs, v);
+}
 
 export const handler = async (event) => {
 
@@ -77,6 +137,14 @@ export const handler = async (event) => {
         }
       }
       console.log(`Re-listing existing vehicle for owner (archived=${isArchived}):`, vin);
+      // Canonicalize intrinsic specs from the MMYT catalog (gold standard).
+      const relistSpecs = await canonicalSpecs({
+        year: event.year || existing.year,
+        make: event.make || existing.make,
+        model: event.model || existing.model,
+        trim: event.trim || existing.trim,
+        specs: existing.specs || event.specs || null,
+      });
       const refreshed = {
         ...existing,
         vin,
@@ -96,7 +164,7 @@ export const handler = async (event) => {
         type: event.type || existing.type || null,
         // REUSE the stored advanced specs (they don't change for a VIN) so we
         // never pay for a re-decode; only take the event's if none is stored.
-        specs: existing.specs || event.specs || null,
+        specs: relistSpecs,
         features: existing.features || event.features || null,
         ev_spec: existing.ev_spec || event.ev_spec || event.evSpec || null,
         evSpec: existing.evSpec || event.evSpec || event.ev_spec || null,
@@ -177,7 +245,7 @@ export const handler = async (event) => {
       serviceRecords: [],
       recall: event.recall,
       type: event.type,
-      specs: event.specs,
+      specs: await canonicalSpecs({ year: event.year, make: event.make, model: event.model, trim: event.trim, specs: event.specs }),
       features: event.features,
       // EV spec snapshot. Written under both naming conventions so the
       // dashboard (VehicleDetails) and marketplace (CarDetailClient) can

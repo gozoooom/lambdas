@@ -1,0 +1,7 @@
+{
+  "name": "zoooom-internal-review-queue",
+  "version": "1.0.0",
+  "description": "One API behind the internal Review Inbox: lists and disposes of KYC, duplicate-VIN and photo-moderation review items",
+  "type": "module",
+  "main": "index.mjs"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "zoooom-internal-listing-image-s3",
+  "version": "1.0.0",
+  "description": "Support-agent access to a customer's listing photos in the same per-env bucket the consumer apps write to",
+  "type": "module",
+  "main": "index.mjs"
+}

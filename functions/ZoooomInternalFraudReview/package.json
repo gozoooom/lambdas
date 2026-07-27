@@ -1,0 +1,7 @@
+{
+  "name": "zoooom-internal-fraud-review",
+  "version": "1.0.0",
+  "description": "Flagged-account fraud review queue for the internal dashboard; posts decisions to Slack via Secrets Manager",
+  "type": "module",
+  "main": "index.mjs"
+}

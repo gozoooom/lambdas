@@ -1,0 +1,7 @@
+{
+  "name": "zoooom-internal-dashboard-stats",
+  "version": "1.0.0",
+  "description": "Totals and review-queue depths for the internal dashboard landing page",
+  "type": "module",
+  "main": "index.mjs"
+}

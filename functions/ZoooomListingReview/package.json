@@ -1,0 +1,7 @@
+{
+  "name": "zoooom-listing-review",
+  "version": "1.0.0",
+  "description": "Posts everything awaiting human review (blocked seller verifications, duplicate-VIN claims, flagged listing photos) to Slack #listing-review — real-time alerts via DynamoDB streams plus a daily digest of what is still open",
+  "type": "module",
+  "main": "index.mjs"
+}

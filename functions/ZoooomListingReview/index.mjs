@@ -29,8 +29,8 @@
  *
  * Invoke {dryRun:true} to render the digest to logs without posting.
  */
-import { DynamoDBClient, ScanCommand } from "@aws-sdk/client-dynamodb";
-import { unmarshall } from "@aws-sdk/util-dynamodb";
+import { DynamoDBClient, ScanCommand, QueryCommand, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
+import { unmarshall, marshall } from "@aws-sdk/util-dynamodb";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 
 const REGION = process.env.AWS_REGION || "us-west-2";
@@ -237,14 +237,22 @@ function renderAlert(item) {
   return `⚠️ *${titles[item.kind] || "Needs review"}*\n*Who:* ${item.who}${vin}\n*Why:* ${item.why}${link(item.id)}`;
 }
 
+// Cached across warm invocations; both posting and editing need it.
+let cachedToken = null;
+async function slackToken() {
+  if (cachedToken) return cachedToken;
+  const sec = await sm.send(new GetSecretValueCommand({ SecretId: SLACK_SECRET_ID }));
+  cachedToken = JSON.parse(sec.SecretString || "{}").botToken || null;
+  return cachedToken;
+}
+
 async function postSlack(text, channel = CHANNEL) {
   if (!channel) {
     console.warn("no channel configured for this post — not sending. Would have sent:\n" + text);
     return { ok: false, reason: "no_channel", preview: text };
   }
-  const sec = await sm.send(new GetSecretValueCommand({ SecretId: SLACK_SECRET_ID }));
-  const creds = JSON.parse(sec.SecretString || "{}");
-  if (!creds.botToken) {
+  const token = await slackToken();
+  if (!token) {
     console.warn("no Slack botToken — skipping");
     return { ok: false, reason: "no_token" };
   }
@@ -252,13 +260,83 @@ async function postSlack(text, channel = CHANNEL) {
     method: "POST",
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      Authorization: `Bearer ${creds.botToken}`,
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({ channel, text, unfurl_links: false }),
   });
   const j = await r.json();
   if (!j.ok) console.warn("Slack post failed:", j.error);
+  return j; // carries .ts + .channel on success
+}
+
+
+/**
+ * An alert is a point-in-time event; Slack messages don't retract themselves.
+ * A seller who fixes their upload seconds later leaves a message on the wall
+ * saying their listing is blocked when it isn't — which is worse than no
+ * alert, because the team acts on it.
+ *
+ * So we remember which message announced a review, and rewrite that same
+ * message when the seller resolves it themselves. The queue already ignored
+ * these; now the channel agrees with the queue.
+ */
+async function rememberAlert(pk, sk, ts, channel) {
+  if (!ts || !channel) return;
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: KYC_TABLE,
+      Key: marshall({ pk, sk }),
+      UpdateExpression: "SET slackTs = :t, slackChannel = :c",
+      ExpressionAttributeValues: marshall({ ":t": ts, ":c": channel }),
+    }));
+  } catch (e) {
+    console.error("[listingReview] could not record slack ts:", e);
+  }
+}
+
+async function slackUpdate(channel, ts, text) {
+  const token = await slackToken();
+  if (!token) return { ok: false };
+  const r = await fetch("https://slack.com/api/chat.update", {
+    method: "POST",
+    headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ channel, ts, text }),
+  });
+  const j = await r.json();
+  if (!j.ok) console.warn("[listingReview] chat.update failed:", j.error);
   return j;
+}
+
+/**
+ * The seller verified. Rewrite any still-open alert we posted for them.
+ * Only touches rows we actually alerted on (they carry slackTs), and clears
+ * the marker so a later re-verify can't rewrite the same message twice.
+ */
+async function resolveOpenAlertsFor(pk, verifiedAt) {
+  const res = await ddb.send(new QueryCommand({
+    TableName: KYC_TABLE,
+    KeyConditionExpression: "pk = :pk AND begins_with(sk, :v)",
+    ExpressionAttributeValues: marshall({ ":pk": pk, ":v": "vfy#" }),
+  }));
+  let updated = 0;
+  for (const raw of res.Items || []) {
+    const r = unmarshall(raw);
+    if (!r.slackTs || !r.slackChannel) continue;
+    if (r.decision !== "REVIEW") continue;
+    await slackUpdate(r.slackChannel, r.slackTs,
+      `✅ *Resolved — seller re-verified*\n` +
+      `~Listing blocked — seller verification needs review~\n` +
+      `*Who:* ${shortName(r.dlFirstName, r.dlLastName)}` +
+      (r.vin ? `\n*VIN:* ${r.vin}` : "") +
+      `\n_They retried and passed at ${verifiedAt}. No action needed._`);
+    await ddb.send(new UpdateItemCommand({
+      TableName: KYC_TABLE,
+      Key: marshall({ pk, sk: r.sk }),
+      UpdateExpression: "REMOVE slackTs, slackChannel",
+    }));
+    updated++;
+  }
+  return updated;
 }
 
 /**
@@ -282,6 +360,8 @@ function streamRecordToItem(record) {
     if (Old && Old.decision === "REVIEW") return null; // already alerted
     return {
       kind: "kyc",
+      pk: New.pk,
+      sk: New.sk,
       id: New.verificationId || String(New.sk || "").replace(/^vfy#/, ""),
       at: New.updatedAt || New.createdAt || "",
       who: shortName(New.dlFirstName, New.dlLastName),
@@ -311,20 +391,43 @@ export const handler = async (event = {}) => {
   // ── ALERT: DynamoDB stream ────────────────────────────────────────────────
   if (Array.isArray(event.Records) && event.Records[0]?.eventSource === "aws:dynamodb") {
     const items = event.Records.map(streamRecordToItem).filter(Boolean);
-    if (!items.length) return { ok: true, mode: "alert", posted: 0, seen: event.Records.length };
+    if (!items.length && !event.Records.some((r) => (r.eventSourceARN || "").includes(KYC_TABLE))) return { ok: true, mode: "alert", posted: 0, resolved: 0, seen: event.Records.length };
+
+    // A seller verifying is not an alert — it's a retraction of one.
+    let resolved = 0;
+    for (const rec of event.Records) {
+      const tbl = (rec.eventSourceARN || "").split("/")[1] || "";
+      if (tbl !== KYC_TABLE) continue;
+      const N = rec.dynamodb?.NewImage ? unmarshall(rec.dynamodb.NewImage) : null;
+      const O = rec.dynamodb?.OldImage ? unmarshall(rec.dynamodb.OldImage) : null;
+      if (!N) continue;
+      const nowVerified =
+        (N.sk === "KYC#STATUS" && N.verified && !(O && O.verified)) ||
+        (String(N.sk || "").startsWith("vfy#") && N.decision === "VERIFIED" && O?.decision !== "VERIFIED");
+      if (!nowVerified) continue;
+      try {
+        resolved += await resolveOpenAlertsFor(N.pk, N.verifiedAt || N.updatedAt || "just now");
+      } catch (e) {
+        console.error("[listingReview] resolve failed:", e);
+      }
+    }
 
     let posted = 0;
     for (const item of items) {
       // One failed post must not poison the batch — a thrown error would make
       // Lambda retry the whole shard and re-alert everything that did succeed.
       try {
-        const res = await postSlack(renderAlert(item), channelFor(item.kind));
-        if (res.ok) posted++;
+        const ch = channelFor(item.kind);
+        const res = await postSlack(renderAlert(item), ch);
+        if (res.ok) {
+          posted++;
+          if (item.kind === "kyc" && item.pk) await rememberAlert(item.pk, item.sk, res.ts, res.channel || ch);
+        }
       } catch (e) {
         console.error("alert post failed for", item.kind, item.id, e);
       }
     }
-    return { ok: true, mode: "alert", posted, seen: event.Records.length };
+    return { ok: true, mode: "alert", posted, resolved, seen: event.Records.length };
   }
 
   // ── DIGEST: scheduled ─────────────────────────────────────────────────────

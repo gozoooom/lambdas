@@ -15,22 +15,21 @@
  * The rewards and referral routes decode the id token best-effort and carry on
  * without one, because the worst case is a mis-attributed counter. This route
  * hands out write access to an identity-document bucket, so an unverifiable
- * caller gets 401. `identityFromEvent` returning nothing is a hard stop, not a
+ * caller gets 401 — an absent or wrong-environment token is a hard stop, not a
  * fallback.
  *
- * ⚠️ THE TOKEN IS NOT SIGNATURE-VERIFIED. API Gateway has no Cognito authorizer
- * on this route (the mechanic gateway has none configured at all), so this reads
- * the JWT payload without checking the signature — exactly like the sibling
- * routes. That is ACCEPTABLE ONLY because of the constraints below, and it is
- * why they are not optional:
+ * The token IS signature-verified: API Gateway runs a COGNITO_USER_POOLS
+ * authorizer on this route, so `requestContext.authorizer.claims` only exists
+ * for a genuinely signed, unexpired token. Because one authorizer serves all
+ * three stages (the mechanic app has a pool per environment), mechanicAuth.mjs
+ * additionally binds the token's issuer to this stage's pool — otherwise a
+ * dev-pool token would authorize against prod.
+ *
+ * The constraints below still hold as defence in depth:
  *   · the URL is PUT-only — it can never read an existing object back
- *   · the key path is built server-side from the caller's own sub; nothing in
- *     the request body can steer where the bytes land
- *   · content type is allow-listed to images, and size is capped
+ *   · the key path is built server-side from sanitised inputs
+ *   · content type is allow-listed to images
  *   · the URL expires in 5 minutes
- * The realistic worst case is a forged token writing junk images into a key
- * prefix it does not own. Adding a real Cognito authorizer to this route is
- * tracked as the follow-up; do NOT relax any constraint above until it exists.
  *
  * ── THE CLIENT NEVER CHOOSES THE KEY ─────────────────────────────────────────
  * Keys are `<env>/<masterMechanicId>/<dealId>/<artifact>-<uuid>.<ext>`, all
@@ -40,9 +39,32 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { randomUUID } from "node:crypto";
+import { verifiedCaller } from "./mechanicAuth.mjs";
 
 const REGION = process.env.REGION || process.env.AWS_REGION || "us-west-2";
 const s3 = new S3Client({ region: REGION });
+
+/**
+ * MASTER SWITCH — OFF until Zoooom financing launches.
+ *
+ * The $25 verification tier only exists for FINANCED purchases, and financing is
+ * not live. Until it is, there is no business purpose for holding a stranger's
+ * driver's licence, and collecting government ID you have no current use for is
+ * the kind of thing that is indefensible in a breach review however good the
+ * bucket controls are. So this refuses to mint upload URLs at all.
+ *
+ * THIS IS THE REAL CONTROL, NOT THE UI. The mobile app's capture screen is also
+ * disabled, but an app build already on a phone cannot be un-shipped — a stale
+ * binary must not be able to push ID documents into the bucket. The server is
+ * the only place that can guarantee that, so the switch lives here and the UI
+ * merely agrees with it.
+ *
+ * To enable: set VERIFICATION_UPLOADS_ENABLED=true on the target alias (via
+ * lib/promote.sh --set, so it is baked per environment) AND settle retention
+ * first — see RETENTION_NOTE in lib/create-deal-verification-buckets.sh. Object
+ * Lock cannot be added once objects exist.
+ */
+const UPLOADS_ENABLED = process.env.VERIFICATION_UPLOADS_ENABLED === "true";
 
 /** Short enough that a leaked URL is near-worthless; long enough for shop wifi. */
 const URL_TTL_SECONDS = 300;
@@ -98,31 +120,24 @@ const safeSegment = (v, max = 80) =>
     .replace(/-+/g, "-")
     .slice(0, max);
 
-function identityFromEvent(event) {
-  const claims = event?.requestContext?.authorizer?.claims;
-  if (claims?.sub) return { userId: claims.sub, email: claims.email || null };
-  const h = event?.headers || {};
-  const raw = h.Authorization || h.authorization || "";
-  const parts = raw.replace(/^Bearer\s+/i, "").trim().split(".");
-  if (parts.length !== 3) return {};
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-    // An expired token is not a valid caller. This is the one claim worth
-    // checking even without signature verification — it costs nothing and stops
-    // a stale token lying around on a device from still minting upload URLs.
-    if (payload.exp && Date.now() / 1000 > payload.exp) return {};
-    return { userId: payload.sub || null, email: payload.email || null };
-  } catch {
-    return {};
-  }
-}
-
 export const handler = async (event, context) => {
   const method = event?.httpMethod || event?.requestContext?.http?.method || "POST";
   if (method === "OPTIONS") return reply(200, { ok: true });
 
   const env = envSuffix(context);
   const Bucket = bucketFor(env);
+
+  // Checked BEFORE parsing, authenticating, or touching S3: when the feature is
+  // off there is nothing to validate and no reason to read a caller's payload.
+  if (!UPLOADS_ENABLED) {
+    return reply(503, {
+      ok: false,
+      enabled: false,
+      error: "verification_uploads_disabled",
+      message:
+        "Deal verification opens when Zoooom financing launches. We're not collecting documents yet.",
+    });
+  }
 
   let body = {};
   try {
@@ -131,10 +146,18 @@ export const handler = async (event, context) => {
     return reply(400, { error: "invalid JSON body" });
   }
 
-  const identity = identityFromEvent(event);
-  if (!identity.userId) {
-    return reply(401, { error: "sign in required to upload verification documents" });
+  // Claims come from the API Gateway Cognito authorizer, i.e. AFTER signature
+  // verification — plus an issuer check binding the token to THIS environment's
+  // pool (one authorizer necessarily trusts all three). See mechanicAuth.mjs.
+  const caller = verifiedCaller(event, context);
+  if (!caller.ok) {
+    return reply(401, {
+      error: "sign in required to upload verification documents",
+      reason: caller.reason,
+      detail: caller.detail,
+    });
   }
+  const identity = { userId: caller.userId, email: caller.email };
 
   const masterMechanicId = safeSegment(body.masterMechanicId, 120);
   const dealId = safeSegment(body.dealId, 120);

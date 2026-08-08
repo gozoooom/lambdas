@@ -197,7 +197,8 @@
         "Prod": "published"
       },
       "gateway": "h7g4lqgvof GET/POST/OPTIONS /MechanicRewards via ${stageVariables.lambdaAlias}",
-      "purpose": "Mechanic rewards + referral API. ensure-code / claim-signup-bonus / record-verification / request-redemption. QUALIFIER-BASED: tables AND the referral base URL derive from the invoked alias, so one published version is correct in all 3 envs. Deterministic rewardIds under attribute_not_exists prevent double-pay."
+      "purpose": "Mechanic rewards + referral API. ensure-code / claim-signup-bonus / record-verification / request-redemption. QUALIFIER-BASED: tables AND the referral base URL derive from the invoked alias, so one published version is correct in all 3 envs. Deterministic rewardIds under attribute_not_exists prevent double-pay.",
+      "auth": "Behind CognitoMechanicAuthorizer. Was best-effort/unauthenticated; now 401 without a verified token."
     },
     {
       "name": "ZoooomMechanicReferralTrack",
@@ -252,8 +253,12 @@
       "gateway": "h7g4lqgvof POST/OPTIONS /MechanicVerificationUpload via ${stageVariables.lambdaAlias}",
       "bundledDeps": "@aws-sdk/client-s3 + @aws-sdk/s3-request-presigner are NOT in the nodejs22 runtime \u2014 vendored in node_modules, so this function ships a ~3MB zip.",
       "storage": "zoooom-deal-verification-{env}, SSE-KMS alias/zv-dealverify-{env}. Provisioned by lib/create-deal-verification-buckets.sh.",
-      "purpose": "Presigned PUT (5 min, PUT-only) for deal-verification captures: buyer/seller photos + BOTH driver's licence scans + title scan. IDENTITY-DOCUMENT data class. AUTH IS MANDATORY here (401 without a token) unlike the sibling mechanic routes \u2014 it hands out write access to an ID bucket. \u26a0\ufe0f Token is NOT signature-verified (no Cognito authorizer on this gateway); acceptable ONLY because the URL is PUT-only, the key is built server-side from the caller's sub, content type is allow-listed, and TTL is 5 min. FOLLOW-UP: add a real Cognito authorizer; do not relax those constraints before then.",
-      "iam": "Managed policy ZoooomDealVerificationUpload (inline budget on basic-user-role is FULL). PutObject only \u2014 no Get/Delete/List."
+      "purpose": "Presigned PUT (5 min, PUT-only) for deal-verification captures: buyer/seller photos + BOTH driver's licence scans + title scan. IDENTITY-DOCUMENT data class. AUTH IS MANDATORY here (401 without a token) unlike the sibling mechanic routes \u2014 it hands out write access to an ID bucket. Token IS signature-verified via the gateway authorizer + per-stage issuer binding.",
+      "iam": "Managed policy ZoooomDealVerificationUpload (inline budget on basic-user-role is FULL). PutObject only \u2014 no Get/Delete/List.",
+      "env": {
+        "VERIFICATION_UPLOADS_ENABLED": "UNSET on all aliases = 503. Financing is not live, so no ID is collected. Settle RETENTION before enabling \u2014 Object Lock cannot be added once objects exist."
+      },
+      "auth": "Behind CognitoMechanicAuthorizer (h7g4lqgvof). Claims are signature-verified by API Gateway; mechanicAuth.mjs binds the token issuer to the stage's pool."
     }
   ]
 }

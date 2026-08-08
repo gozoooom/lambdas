@@ -47,6 +47,9 @@
  *
  * Env resolution mirrors ZoooomReportIntent: explicit *_TABLE per version, else
  * derive the suffix from the invoked alias qualifier, else _dev.
+ *
+ * AUTH: behind the gateway's COGNITO_USER_POOLS authorizer. Claims are verified
+ * by API Gateway; mechanicAuth.mjs binds them to this stage's user pool.
  */
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
@@ -56,6 +59,7 @@ import {
   QueryCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { verifiedCaller } from "./mechanicAuth.mjs";
 
 const REGION = process.env.REGION || process.env.AWS_REGION || "us-west-2";
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
@@ -140,22 +144,6 @@ function randomCode() {
   let out = "";
   for (const b of bytes) out += CODE_ALPHABET[b % CODE_ALPHABET.length];
   return `ZM-${out}`;
-}
-
-/** Best-effort identity — attribution only, never an authorisation decision. */
-function identityFromEvent(event) {
-  const claims = event?.requestContext?.authorizer?.claims;
-  if (claims?.sub) return { userId: claims.sub, email: claims.email || null };
-  const h = event?.headers || {};
-  const raw = h.Authorization || h.authorization || "";
-  const parts = raw.replace(/^Bearer\s+/i, "").trim().split(".");
-  if (parts.length !== 3) return {};
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-    return { userId: payload.sub || null, email: payload.email || null };
-  } catch {
-    return {};
-  }
 }
 
 // ── referral code ────────────────────────────────────────────────────────────
@@ -321,7 +309,14 @@ export const handler = async (event, context) => {
 
   const T = tables(context);
   const BASE = referralBaseUrl(context);
-  const identity = identityFromEvent(event);
+  // This route is behind the gateway's Cognito authorizer, so claims are
+  // signature-verified; mechanicAuth additionally binds the token to this
+  // stage's pool. A shop's balance and payout requests are not public.
+  const caller = verifiedCaller(event, context);
+  if (!caller.ok) {
+    return reply(401, { error: "sign in required", reason: caller.reason, detail: caller.detail });
+  }
+  const identity = { userId: caller.userId, email: caller.email };
 
   try {
     if (method === "GET") {

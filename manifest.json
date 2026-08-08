@@ -106,6 +106,139 @@
       },
       "purpose": "Adds/re-lists a vehicle in the user's garage. Writes createdAt/updatedAt (new add + archived re-add); active re-list PRESERVES createdAt. ZoooomDailyStats counts garage adds off createdAt.",
       "warning": "ENV VARS ARE BAKED INTO PUBLISHED VERSIONS. Never publish from $LATEST and point Prod at it \u2014 that ships DEV table names to prod. Promote by: set $LATEST env to target-env values -> publish -> move alias -> restore $LATEST to dev. Code defaults in index.mjs are _prod (NOT dev-safe) so a missing env var silently hits prod."
+    },
+    {
+      "name": "ZoooomGetMarketValue",
+      "handler": "index.handler",
+      "runtime": "nodejs24.x",
+      "aliases": {
+        "dev": "$LATEST",
+        "Staging": "published",
+        "Prod": "published"
+      },
+      "purpose": "Market value by VIN (VehicleDatabases). MMYT cost cache; falls back to VIN-scoped cache + background VIN decode when ZoooomVinLookup has no row. Per-env via alias + VEHICLE_TABLE."
+    },
+    {
+      "name": "ZoooomMechanicSignupNotify",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "dev": "$LATEST (no staging/prod aliases by design \u2014 one version serves all envs)"
+      },
+      "streams": "ZoooomMechanicUser_{dev,staging,prod} -> unqualified fn (INSERT only). ESM startingPosition LATEST, batch 10, retries 2.",
+      "env": {
+        "MECHANIC_SIGNUP_CHANNEL_PROD": "C0BLV55KHMJ (#new-mechanics)",
+        "MECHANIC_SIGNUP_CHANNEL_STAGING": "empty by design => log only",
+        "MECHANIC_SIGNUP_CHANNEL_DEV": "empty by design => log only",
+        "SLACK_SECRET_ID": "zoooom/slack/support-bot",
+        "MECHANIC_DASHBOARD_URL": "unset (optional per-signup deep link)"
+      },
+      "iam": "basic-user-role inline policy ZoooomMechanicSignupStreams (stream read on the 3 mechanic-user tables).",
+      "purpose": "Announces new mechanic signups in Slack #new-mechanics. STREAM-BASED so neither ZoooomAddMechanicUser nor ZoooomAddMasterMechanicUser had to be touched (both live + on the parity allow-list) and a Slack outage can never fail a signup. Env resolved FROM THE STREAM ARN, so one version serves all three envs and the wrong table can never reach the wrong channel; only prod has a channel configured. Dedups redeliveries via slackSignupTs on the user row. Enriches with shop name (master/legacy table) + role/status (junction table, one 2.5s retry since the link row is written just after the user row)."
+    },
+    {
+      "name": "ZoooomAuditTrail",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "role": "ZoooomAuditWriterRole (NOT basic-user-role) \u2014 stream read + PutItem on ZoooomAudit_{env} only.",
+      "aliases": {
+        "dev": "$LATEST (no staging/prod aliases by design \u2014 env comes from the stream ARN)"
+      },
+      "streams": "20 in-scope business tables x 3 envs = 60 ESMs -> unqualified fn. LATEST, batch 25, window 5s, retries 5, bisectBatchOnFunctionError, onFailure -> SQS ZoooomAuditDLQ.",
+      "env": {
+        "MAX_IMAGE_BYTES": "120000 \u2014 above this, row images are dropped and only changed field names/values are kept so the item can never be rejected for size",
+        "AUDIT_TABLE_OVERRIDE": "unset (normally ZoooomAudit_{env} from the stream ARN)"
+      },
+      "purpose": "Append-only 'who changed what, when' trail. Replaces the never-functional ZoooomInternalUserActionAuditLog (0 rows ever, unreachable, dev table in all envs, body-supplied actor). Stream-based so coverage is structural, not a discipline. Records action/before/after/changedFields; actor read ONLY from a stamped field for that action class (createdBy on CREATE, updatedBy|lastUpdatedBy|approvedBy|reviewedBy on UPDATE, deletedBy on DELETE) \u2014 never cross-falls-back, so unstamped writes read 'unknown' instead of being misattributed to the creator. Sensitive fields redacted. Fails CLOSED (throws -> retries -> DLQ). Immutability enforced in IAM + PITR + deletion protection, verified by lib/audit-coverage.sh.",
+      "known_gaps": "(1) Hard DELETEs are unattributable unless deletedBy is stamped first \u2014 prefer soft-delete/archive. (2) Actor attribution is only as good as the writers: prod is ~92% actorId=unknown until the in-scope mutators stamp an actor. (3) BLOCKER: ZoooomInternalUserAPI{,Staging,Prod} have 84/84 methods with authorizationType NONE, so no verifiable claim exists for internal staff writes \u2014 attach a Cognito authorizer before stamping actors there."
+    },
+    {
+      "name": "ZoooomInternalInbox",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "dev": "$LATEST",
+        "staging": "published",
+        "prod": "published"
+      },
+      "routes": "GET/POST /internal-inbox on all 3 internal APIs, behind ZoooomInternalStaffAuth. OPTIONS=MOCK/NONE for CORS.",
+      "eventbridge": "ZoooomInternalInboxSweep{,-Staging,-Prod} rate(15 minutes) -> $LATEST/:staging/:prod with {action:sweepMissedChats}",
+      "env": {
+        "INBOX_TABLE": "ZoooomInternalUserInbox_{env}",
+        "SUPPORT_CHAT_TABLE": "ZoooomSupportChat_{env}",
+        "STAFF_POOL_ID": "Cognito internal pool for THIS env",
+        "MISSED_AFTER_MINUTES": "15",
+        "LIST_LIMIT": "50"
+      },
+      "purpose": "The inbox belonging to INTERNAL STAFF \u2014 distinct from ZoooomInternalGetUserInbox, which reads a CONSUMER's inbox (ZoooomUserInbox_{env}) for a customer id in the request. Actions: list / markRead / markUnread / broadcast / sweepMissedChats. A support chat that escalated to a human and got no 'agent' reply within MISSED_AFTER_MINUTES is broadcast to EVERY staff inbox. Roster comes from the Cognito staff pool, NOT ZoooomInternalUser_{env} (prod holds 0 rows while the prod pool has 2 real staff, so table-based fan-out would reach nobody). Idempotent: deterministic messageId (missed-chat#<conversationId>#<lastUserMsgId>) + byMessage index check, so the 15-min schedule can never double-post. Identity comes ONLY from the verified Cognito claim; no claim => 401. Support-email (Gmail) ingestion is intentionally NOT built \u2014 broadcast is the seam for it."
+    },
+    {
+      "name": "ZoooomInternalGetMechanic",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "dev": "$LATEST",
+        "staging": "3",
+        "prod": "4"
+      },
+      "env": {
+        "VITE_AWS_MASTER_MECHANIC_TABLE": "ZoooomMasterMechanic_{env}",
+        "VITE_AWS_MECHANIC_TABLE": "ZoooomMechanic_{env} \u2014 DEAD on current code, read only by pre-v3/v4 versions"
+      },
+      "purpose": "Staff mechanic list. Promoted 2026-07-29 so all envs read ZoooomMasterMechanic_{env} (was legacy ZoooomMechanic_{env} on staging/prod). Legacy mechanics are CHILDREN of a master: master is keyed on the Google place/address, while scanned service records can misread mechanic details and create many near-duplicate legacy rows. The master's linkedLegacyMechanics array is the drill-down. KNOWN DATA GAPS: prod stores those entries as plain STRINGS while dev stores OBJECTS; prod linkedRecordsCount disagrees with the array; and linkedToMasterId is unpopulated on legacy rows in ALL envs, so legacy->master navigation does not work."
+    },
+    {
+      "name": "ZoooomMechanicRewards",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "published",
+        "Prod": "published"
+      },
+      "gateway": "h7g4lqgvof GET/POST/OPTIONS /MechanicRewards via ${stageVariables.lambdaAlias}",
+      "purpose": "Mechanic rewards + referral API. ensure-code / claim-signup-bonus / record-verification / request-redemption. QUALIFIER-BASED: tables AND the referral base URL derive from the invoked alias, so one published version is correct in all 3 envs. Deterministic rewardIds under attribute_not_exists prevent double-pay."
+    },
+    {
+      "name": "ZoooomMechanicReferralTrack",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "published",
+        "Prod": "published"
+      },
+      "gateway": "h7g4lqgvof POST/OPTIONS /MechanicReferral via ${stageVariables.lambdaAlias}",
+      "calledBy": "apex src/utils/mechanicReferral.ts + marketplace app/utils/mechanicReferral.ts",
+      "purpose": "Consumer-side attribution. attribute / qualify / lookup. A consumer counts ONCE (conditional flip on the attribution row); the referral row's qualifiedCount is an atomic ADD, so the every-5th $10 milestone fires exactly once under concurrency."
+    },
+    {
+      "name": "ZoooomMechanicSite",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "published",
+        "Prod": "published"
+      },
+      "gateway": "h7g4lqgvof GET/OPTIONS /MechanicSite via ${stageVariables.lambdaAlias}",
+      "purpose": "Public read-only resolver for published shop pages (/[slug]). Allow-listed projection; refuses unpublished records by slug (owner preview goes via masterMechanicId). Scan is paginated + edge-cached; add a GSI on `slug` when published shops reach the hundreds."
+    },
+    {
+      "name": "ZoooomMechanicRewardNotify",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "dev": "$LATEST (no staging/prod aliases by design \u2014 one version serves all envs)"
+      },
+      "streams": "ZoooomMechanicReward_{dev,staging,prod} -> unqualified fn (INSERT + MODIFY). ESM startingPosition LATEST, batch 10, retries 2.",
+      "env": {
+        "REWARD_CHANNEL_PROD": "C0BPPG3LTNU (#mechanic-rewards)",
+        "REWARD_CHANNEL_STAGING": "empty by design => log only",
+        "REWARD_CHANNEL_DEV": "empty by design => log only",
+        "SLACK_SECRET_ID": "zoooom/slack/support-bot"
+      },
+      "purpose": "GIFT CARDS ARE ISSUED BY HAND \u2014 this is the only thing that tells anyone money is owed. Announces PENDING_ISSUE inserts, redemption requests, and HELD->PENDING_ISSUE releases (how banked $25 verifications reach the channel when financing launches). Per-kind dedup stamps survive stream redelivery."
     }
   ]
 }

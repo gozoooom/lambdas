@@ -82,15 +82,31 @@ override every endpoint var.
 4. No trailing/leading whitespace, no doubled hostnames. (We found `" ZoooomContact_prod"` and a
    fused double-URL in the wild.)
 
-### Verify a branch (paste-ready)
+### Verify — run the gate, do NOT eyeball
+Rules 1–2 above were written BEFORE 2026-07-25 and were violated anyway: marketplace
+`prod` never set `NEXT_PUBLIC_REPORT_API_URL`, so prod silently used the DEV report
+backend; apex had 9 app-level vars still on the old shared prod gateway. Nobody saw it
+because the defect was an **absence** — invisible to diffs, to e2e (the other env's
+backend answers fine), and to `parity-check.sh`, which never reads Amplify. A prose
+rule cannot catch an absence. This does:
+
 ```bash
 export AWS_REGION=us-west-2
-APP=d11lhr3ng54bgo BR=dev            # example: marketplace dev
-aws amplify get-branch --app-id $APP --branch-name $BR \
-  --query 'branch.environmentVariables' --output json |
-  python3 -c 'import sys,json;[print(k,"=",v) for k,v in json.load(sys.stdin).items() if any(t in k.upper() for t in ["API","URL","GATEWAY","BASE","ENDPOINT","POOL"])]'
-# Then eyeball: does every value use THIS env's gateway/stage from §1? Any pabikbpzo5 on a non-prod branch = LEAK.
+./lib/env-config-check.sh                 # all apps; exit 1 on any hard failure
+./lib/env-config-check.sh --strict        # also fails on dev-preview inheritance
+./lib/env-config-check.sh d11lhr3ng54bgo  # one app
 ```
+Hard failure = a branch references another environment's resource, **or** a
+prod/staging branch inherits an env-specific var from app-level instead of declaring it.
+
+**Shared resources are declared, not guessed.** The `SHARED` registry inside the script
+lists what is intentionally one-instance-across-envs — the VIN/plate decode caches
+(`ZoooomVinLookup`, `ZoooomMMYT*`, `ZoooomVDCatalog`, `ZoooomTitleChecks`,
+`ZoooomStolenChecks`), taxonomy/reference tables, shared lambdas (`ZoooomVINDecodeVDB`,
+`ZoooomGetEVSpec`), and the single analytics IDs. Sharing those is deliberate — we pay
+an external API once per VIN, not once per environment. Adding to that registry requires
+a one-line reason, and for a lambda: `list-aliases` → 0 **and** no `_dev/_staging/_prod`
+table in its env. **Undeclared sharing is the bug; declared sharing is the design.**
 
 ---
 
@@ -167,6 +183,73 @@ Rules for shared functions:
 - Decision test: **is the data env-specific?** VIN/plate decodes, recall data, OEM catalogs → NO →
   share. Deals/offers/users/KYC/service-records/reports → YES → split per env (`_dev/_staging/_prod`).
 
+### 4b. Slack notification channels — declared absences
+
+Every notifier reads its bot token from Secrets Manager `zoooom/slack/support-bot` (bot `demo_app`,
+team `T088V720SR5`, scopes `chat:write,channels:history,channels:read` — it has **no**
+`channels:manage`, so **new channels must be created by a human in Slack and the bot invited**).
+
+| Channel | ID | Posted to by |
+|---|---|---|
+| `#new-mechanics` | `C0BLV55KHMJ` | `ZoooomMechanicSignupNotify` (prod only) |
+| KYC/listing review | `C0BLSG9N5LY` | `ZoooomListingReview` (`LISTING_REVIEW_CHANNEL`) |
+| ownership/fraud review | `C0BD70188LF` | `ZoooomListingReview`, `ZoooomInternalFraudReview` |
+| support relay | `C0BBKS8521W` | support chat (`channel` in the secret) |
+
+**The rule: an unset channel variable must mean "render to CloudWatch", never "fall back to another
+channel".** dev and staging carry e2e traffic, so their channel vars are **deliberately empty** — a
+test signup in `#new-mechanics` teaches the team to ignore the channel, which is worse than no
+alert. That absence is intentional and declared here, exactly as `env-config-check.sh` requires of
+frontend vars: sharing/omission is fine, *undeclared* sharing/omission is the bug.
+
+---
+
+## 4c. Audit trail — who changed what, when (`ZoooomAuditTrail`)
+
+**Design:** DynamoDB streams on the **20 in-scope business tables × 3 envs (60 mappings)** feed one
+append-only writer into `ZoooomAudit_{env}`. Streams — not an audit call inside each lambda — because
+the previous design asked 389 lambdas to remember, and its table held **zero rows**. A forgotten audit
+call is an absence, invisible to review; a stream sits downstream of the write and cannot be bypassed.
+
+**In scope (20):** `ZoooomUser`, `ZoooomMechanicUser`, `ZoooomInternalUser`, `ZoooomMechanicUserShop`,
+`KycSession`, `ZoooomMasterMechanic`, `ZoooomMechanic`, `ZoooomMechanicConsumer`, `ZoooomVehicle`,
+`ZoooomVehicleListing`, `ZoooomVehicleTransfers`, `ZoooomVehicleReports`, `ZoooomDeals`, `ZoooomOffers`,
+`ZoooomPlaidAccess`, `ZoooomSentGiftCardRewards`, `ZoooomFraudReview`, `ZoooomModerationReview`,
+`ZoooomOfacScreenings`, `ZoooomServiceRecord`. Caches/catalogs/sessions are deliberately out — machine
+written reference data with no actor to attribute.
+
+**Query paths (never scan):** PK `entity` = `<EntityType>#<id>`, SK `seq` = `<ts>#<eventID>`
+(deterministic, so a stream retry rewrites the same row instead of appending a phantom event).
+GSIs: `byActor` ("everything employee X did"), `byEntityType`, `byDay` (daily review evidence).
+
+**Immutability is IAM, not code.** `ZoooomAuditTrail` runs as `ZoooomAuditWriterRole` (stream read +
+PutItem only — it cannot alter what it wrote). `basic-user-role` carries an **explicit Deny** on
+Put/Update/Delete/BatchWrite against the audit tables, which beats the broad
+`temp-dynamo-read-write-fulltables` allow already on that role. PITR + deletion protection on. Failures
+throw → 5 retries → **SQS `ZoooomAuditDLQ`**; a silently dropped audit record is the one outcome worse
+than a wedged shard.
+
+**Actor rules — read this before stamping anything.** The stream carries the row, not the caller, so
+"who" is only as good as the field the writer stamped. Resolution never crosses action classes:
+`createdBy` on CREATE, `updatedBy|lastUpdatedBy|approvedBy|reviewedBy` on UPDATE, `deletedBy` on
+DELETE. An unstamped update records `actorId: "unknown"`, **never** the creator — a fabricated actor
+reads as authoritative and is believed, while an admitted gap is measurable
+(`byActor` = `unknown`, reported by `audit-coverage.sh`). Use `lib/audit-actor.mjs`; copy it into the
+function directory and never re-derive the actor from the request body.
+
+**Two open gaps (2026-07-29):**
+1. **Hard deletes are unattributable** — the row that could name the actor is the one being removed.
+   Prefer soft-delete/archive (`ZoooomDeleteVehicle` already does), or stamp `deletedBy` then delete.
+2. **HARD BLOCKER for staff attribution:** `ZoooomInternalUserAPI{,Staging,Prod}` have **84/84 methods
+   at `authorizationType NONE`** with no resource policy, WAF or API key. No authorizer means no claim,
+   so any actor recorded for an internal write would be caller-supplied — and those endpoints
+   (password reset, gift-card issuance, listing management) are publicly reachable today. Attach a
+   Cognito authorizer against the `ZoooomInternalUser` pool **before** stamping actors in the 12
+   in-scope internal mutators.
+
+Gate: `./lib/audit-coverage.sh` — hard-fails on a missing stream/mapping, a mutable audit table, or an
+unauthenticated internal API; warns with the `unknown`-actor percentage per env.
+
 ---
 
 ## 5. Pre-flight verification checklist (run before calling a change "done")
@@ -184,14 +267,24 @@ RID=$(aws apigateway get-resources --rest-api-id <gw> --limit 500 --query "items
 aws apigateway get-integration --rest-api-id <gw> --resource-id $RID --http-method <M> --query 'uri' --output text
 # dev gw → :Dev/unqualified ; staging gw → :Staging ; prod gw → :Prod
 
-# C) A frontend branch's endpoints match its env (see §2 verify block). Any pabikbpzo5 on non-prod = LEAK.
+# C) Frontend config gate — REQUIRED, not optional. Covers what A/B cannot see:
+./lib/env-config-check.sh          # exit 1 = a branch points at the wrong env, or a
+                                   # prod/staging branch inherits an endpoint var
+./lib/parity-check.sh              # backend: alias/code/config/env drift + routes
+./lib/audit-coverage.sh            # audit trail: stream+mapping per in-scope table,
+                                   # audit-table immutability, internal-API authz,
+                                   # unknown-actor rate (see §4c)
 
-# D) After ANY frontend env change: rebuild the branch, then confirm live behavior.
+# D) After ANY frontend env change: rebuild the branch, then confirm live behavior:
+#    curl the deployed bundle and grep for the gateway id — it must contain THIS env's
+#    id and NONE of the other two. (Vite/Next inline env at build time.)
 ```
 
 **Golden test for a "dev" write path:** perform the dev action, then confirm the row landed in
 the **`_dev`** table (and NOT in `_prod`). This is exactly the check that would have caught the
-offer split-brain immediately.
+offer split-brain immediately. State it as a two-sided assertion in e2e: **present in this
+env's table AND absent from the other two** — a one-sided "row exists" assertion passes just
+as happily when the write went to the wrong environment.
 
 ---
 

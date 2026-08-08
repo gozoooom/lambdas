@@ -29,10 +29,31 @@
 # serve both correctly.
 set -euo pipefail
 
-FN="${1:?usage: promote.sh <FunctionName> <Staging|Prod> [--yes]}"
-TARGET="${2:?usage: promote.sh <FunctionName> <Staging|Prod> [--yes]}"
-ASSUME_YES="${3:-}"
+FN="${1:?usage: promote.sh <FunctionName> <Staging|Prod> [--yes] [--set KEY=VALUE]...}"
+TARGET="${2:?usage: promote.sh <FunctionName> <Staging|Prod> [--yes] [--set KEY=VALUE]...}"
+shift 2
 REGION="${AWS_REGION:-us-west-2}"
+
+# --set KEY=VALUE (repeatable) adds/overrides an env var on the TARGET env for this
+# promote. Needed when a release introduces a NEW variable that no alias has yet —
+# the alias env is the source of truth, so a brand-new key cannot come from there.
+# Values still go through the cross-wire guard below, so a `_dev` value aimed at
+# Prod is still rejected. Use ONLY for genuinely new keys; never to "fix" drift.
+ASSUME_YES=""
+EXTRA_JSON="{}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --yes) ASSUME_YES="--yes"; shift ;;
+    --set)
+      KV="${2:?--set needs KEY=VALUE}"
+      case "$KV" in *=*) ;; *) echo "ABORT: --set expects KEY=VALUE (got '$KV')"; exit 1 ;; esac
+      EXTRA_JSON=$(python3 -c "
+import json,sys
+d=json.loads(sys.argv[1]); k,_,v=sys.argv[2].partition('='); d[k]=v; print(json.dumps(d))" "$EXTRA_JSON" "$KV")
+      shift 2 ;;
+    *) echo "ABORT: unknown arg '$1'"; exit 1 ;;
+  esac
+done
 
 case "$(echo "$TARGET" | tr '[:upper:]' '[:lower:]')" in
   staging) WANT_SUFFIX="staging" ;;
@@ -73,6 +94,17 @@ if ! TARGET_ENV_JSON=$(aws lambda get-function-configuration --function-name "$F
   exit 1
 fi
 [ "$TARGET_ENV_JSON" = "null" ] && TARGET_ENV_JSON='{}'
+
+# Merge any --set overrides in BEFORE the cross-wire guard, so new values are
+# validated by exactly the same rule as inherited ones.
+if [ "$EXTRA_JSON" != "{}" ]; then
+  TARGET_ENV_JSON=$(python3 -c "
+import json,sys
+base=json.loads(sys.argv[1]); extra=json.loads(sys.argv[2])
+for k,v in extra.items():
+    print(f'   --set {k}={v}' + ('  (overrides existing)' if k in base else '  (new key)'), file=sys.stderr)
+base.update(extra); print(json.dumps(base))" "$TARGET_ENV_JSON" "$EXTRA_JSON")
+fi
 
 # ── 3. Refuse to promote if the target's OWN env is already cross-wired ────────
 BAD=$(python3 - "$TARGET_ENV_JSON" "$WANT_SUFFIX" <<'PY'

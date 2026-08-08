@@ -2,8 +2,8 @@
 #
 # wire-mechanic-reward-routes.sh
 #
-# Add /MechanicRewards, /MechanicReferral and /MechanicSite to the mechanic
-# API (h7g4lqgvof)
+# Add /MechanicRewards, /MechanicReferral, /MechanicSite and
+# /MechanicVerificationUpload to the mechanic API (h7g4lqgvof)
 # and deploy all three stages. Idempotent — safe to re-run.
 #
 # ── TWO THINGS THIS DOES DIFFERENTLY FROM THE ROUTES ALREADY ON THIS GATEWAY ──
@@ -113,6 +113,12 @@ RID=$(ensure_resource MechanicSite)
 ensure_lambda_method "$RID" GET ZoooomMechanicSite
 ensure_options "$RID" "GET,OPTIONS"
 grant_invoke ZoooomMechanicSite
+
+echo "── /MechanicVerificationUpload (presigned PUT) ───────"
+RID=$(ensure_resource MechanicVerificationUpload)
+ensure_lambda_method "$RID" POST ZoooomMechanicVerificationUpload
+ensure_options "$RID" "POST,OPTIONS"
+grant_invoke ZoooomMechanicVerificationUpload
 
 echo "── stage variables ───────────────────────────────────"
 set_stage_var() {

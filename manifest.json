@@ -239,6 +239,21 @@
         "SLACK_SECRET_ID": "zoooom/slack/support-bot"
       },
       "purpose": "GIFT CARDS ARE ISSUED BY HAND \u2014 this is the only thing that tells anyone money is owed. Announces PENDING_ISSUE inserts, redemption requests, and HELD->PENDING_ISSUE releases (how banked $25 verifications reach the channel when financing launches). Per-kind dedup stamps survive stream redelivery."
+    },
+    {
+      "name": "ZoooomMechanicVerificationUpload",
+      "handler": "index.handler",
+      "runtime": "nodejs22.x",
+      "aliases": {
+        "Dev": "$LATEST",
+        "Staging": "published",
+        "Prod": "published"
+      },
+      "gateway": "h7g4lqgvof POST/OPTIONS /MechanicVerificationUpload via ${stageVariables.lambdaAlias}",
+      "bundledDeps": "@aws-sdk/client-s3 + @aws-sdk/s3-request-presigner are NOT in the nodejs22 runtime \u2014 vendored in node_modules, so this function ships a ~3MB zip.",
+      "storage": "zoooom-deal-verification-{env}, SSE-KMS alias/zv-dealverify-{env}. Provisioned by lib/create-deal-verification-buckets.sh.",
+      "purpose": "Presigned PUT (5 min, PUT-only) for deal-verification captures: buyer/seller photos + BOTH driver's licence scans + title scan. IDENTITY-DOCUMENT data class. AUTH IS MANDATORY here (401 without a token) unlike the sibling mechanic routes \u2014 it hands out write access to an ID bucket. \u26a0\ufe0f Token is NOT signature-verified (no Cognito authorizer on this gateway); acceptable ONLY because the URL is PUT-only, the key is built server-side from the caller's sub, content type is allow-listed, and TTL is 5 min. FOLLOW-UP: add a real Cognito authorizer; do not relax those constraints before then.",
+      "iam": "Managed policy ZoooomDealVerificationUpload (inline budget on basic-user-role is FULL). PutObject only \u2014 no Get/Delete/List."
     }
   ]
 }

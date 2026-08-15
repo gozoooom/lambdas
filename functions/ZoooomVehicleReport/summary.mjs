@@ -80,11 +80,17 @@ export function buildSummary(s) {
   // title check above (never present an unverified clear as a verified one).
   const open = s.recalls?.open || 0;
   const repaired = s.recalls?.repaired || 0;
+  const totalRecalls = s.recalls?.total || open + repaired;
   cats.push(
     open > 0
       ? cat("recalls", "Open recalls", "caution",
-          `${open} open recall${open > 1 ? "s" : ""} — often a FREE dealer fix.`,
-          { count: open, ...(repaired ? { repaired } : {}) })
+          repaired > 0
+            ? `${open} of ${totalRecalls} recalls still open — often a FREE dealer fix. ${repaired} already marked repaired by the owner.`
+            : `${open} open recall${open > 1 ? "s" : ""} — often a FREE dealer fix.`,
+          // Deduct in proportion to what's STILL open, so each recall the owner
+          // completes raises the score instead of nothing moving until the last one.
+          { count: open, weight: totalRecalls > 0 ? open / totalRecalls : 1,
+            ...(repaired ? { repaired } : {}) })
       : repaired > 0
       ? cat("recalls", "Open recalls", "clear",
           `No open recalls — the owner marked ${repaired === 1 ? "the recall" : `all ${repaired} recalls`} repaired. Owner-reported; ask for the dealer repair receipt.`,
@@ -221,7 +227,13 @@ function titleTransferFor(s) {
 function computeScore(cats) {
   let score = 100;
   const DEDUCT = { serious: 30, caution: 12, review: 3, clear: 0 };
-  for (const c of cats) score -= DEDUCT[c.status] * (c.soft ? 0.3 : 1);
+  // `weight` (0..1) scales a category's deduction when the finding is PARTLY
+  // resolved — used by recalls so fixing 1 of 3 visibly moves the score instead
+  // of waiting until all 3 are done. Absent → full deduction, as before.
+  for (const c of cats) {
+    const w = Number.isFinite(c.weight) ? Math.max(0, Math.min(1, c.weight)) : 1;
+    score -= DEDUCT[c.status] * (c.soft ? 0.3 : 1) * w;
+  }
   return Math.max(5, Math.round(score));
 }
 

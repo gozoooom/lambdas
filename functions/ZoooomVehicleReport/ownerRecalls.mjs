@@ -41,7 +41,11 @@ export async function getOwnerRecallAcks({ docClient, vin }) {
       // archived row is a car the user removed — its check-offs don't count.
       if (row.archived) continue;
       for (const rc of Array.isArray(row.recall) ? row.recall : []) {
-        if (rc?.notification_status === "acknowledged" && rc?.recall_number) {
+        // "acknowledged" = owner ticked it off; "archived" = they then filed it
+        // away. Both mean the same thing for the report — the repair happened —
+        // so archiving must never make a recall look open again.
+        const st = rc?.notification_status;
+        if ((st === "acknowledged" || st === "archived") && rc?.recall_number) {
           acks.add(normCampaign(rc.recall_number));
         }
       }

@@ -40,6 +40,7 @@ import { createCheckoutSession, retrieveCheckoutSession, stripeConfigured } from
 import { redactToPreview } from "./preview.mjs";
 import { monthlyMarketValue } from "./marketValue.mjs";
 import { getOwnerOdometer } from "./ownerOdometer.mjs";
+import { getOwnerRecallAcks, normCampaign } from "./ownerRecalls.mjs";
 import { buildTaxTable } from "./taxRules.mjs";
 
 const REGION = process.env.REGION || "us-west-2";
@@ -452,9 +453,18 @@ export const handler = async (event) => {
   // 0b. Odometer the owner entered in the garage / listing wizard. Resolved before
   //     the cache gate because a changed odometer must invalidate a stored report —
   //     the whole point is that the report prices against the CURRENT mileage.
-  const owner = await getOwnerOdometer({ docClient, vin });
+  // 0c. Recalls the owner already checked off in the garage. Same reason as the
+  //     odometer: resolved BEFORE the cache gate, because checking one off has to
+  //     invalidate a stored report — otherwise the fix wouldn't show for 30 days.
+  const [owner, recallAcks] = await Promise.all([
+    getOwnerOdometer({ docClient, vin }),
+    getOwnerRecallAcks({ docClient, vin }),
+  ]);
   const ownerMileage = owner?.mileage ?? null;
   if (ownerMileage) console.log(`🚗 owner odometer ${ownerMileage} mi (${owner.listed ? "listed" : "garage"})`);
+  // Sorted+joined so it compares like mileageUsed does — a plain string equality.
+  const recallAcksKey = recallAcks.join(",");
+  if (recallAcksKey) console.log(`🔧 owner marked ${recallAcks.length} recall(s) repaired`);
 
   // 1. Cache (by VIN) — return a fresh report if we have one.
   if (docClient && REPORTS_TABLE) {
@@ -463,15 +473,24 @@ export const handler = async (event) => {
       const r = cached?.Item;
       const cachedMileage = r?.mileageUsed ?? null;
       const mileageChanged = (cachedMileage ?? null) !== (ownerMileage ?? null);
+      // Reports cached before this field existed read as "" — which equals the key
+      // for an owner who has checked nothing off, so untouched cars aren't forced
+      // to rebuild. A car WITH check-offs rebuilds once, which is the point.
+      const cachedAcks = r?.recallAcksUsed ?? "";
+      const acksChanged = cachedAcks !== recallAcksKey;
       // Once-per-month gate: serve the stored report until it's REGEN_DAYS old —
       // unless the odometer moved since it was built (new listing, updated garage
-      // mileage), which makes the stored market value wrong for this car.
-      if (r?.report && r.generatedAt && (Date.now() - new Date(r.generatedAt).getTime()) / 86400000 < REGEN_DAYS && !mileageChanged) {
+      // mileage), which makes the stored market value wrong for this car, or the
+      // owner checked a recall off (that has to drop out of the score immediately).
+      if (r?.report && r.generatedAt && (Date.now() - new Date(r.generatedAt).getTime()) / 86400000 < REGEN_DAYS && !mileageChanged && !acksChanged) {
         console.log(`✅ Returning stored report (${unlocked ? "full" : "preview"}) — generated ${r.generatedAt}`);
         return respond(r.report, { cached: true });
       }
       if (r?.report && mileageChanged) {
         console.log(`♻️ Odometer changed (${cachedMileage ?? "none"} → ${ownerMileage ?? "none"}) — regenerating report`);
+      }
+      if (r?.report && acksChanged) {
+        console.log(`♻️ Owner recall check-offs changed ("${cachedAcks}" → "${recallAcksKey}") — regenerating report`);
       }
     } catch (e) {
       console.warn("⚠️ Report cache read failed:", e.message);
@@ -520,15 +539,37 @@ export const handler = async (event) => {
   // keeps a slow VD title-check (block 2) and the market lookup from stacking
   // toward the 29s API Gateway integration ceiling. state/mileage are already
   // resolved above, so it has everything it needs here.
+  // Persistent last-good cache for the slow external APIs (FEMA/NHTSA): on a hang
+  // they fall back to the previous cached result instead of blanking the section.
+  const extCache = { docClient, table: REPORTS_TABLE };
   const [flood, knownIssues, inspection, marketValue] = await Promise.all([
-    assessFlood(title, sales),
-    getKnownIssues(make, model, year),
+    assessFlood(title, sales, extCache),
+    getKnownIssues(make, model, year, extCache),
     getInspection(vin),
     monthlyMarketValue({
       docClient, table: MARKET_VALUE_TABLE, vin, state, mileage,
       userId: caller?.userId, authToken, regenDays: REGEN_DAYS,
     }),
   ]);
+
+  // 4b. Subtract the recalls the owner checked off in the garage. NHTSA's list is
+  // model-level — it can't know this particular car was repaired — so the owner's
+  // check-off is the only signal we have, and until now the report ignored it
+  // entirely (a car with every recall fixed still read "2 open recalls" and still
+  // carried the deduction). Both sides key off NHTSACampaignNumber.
+  const totalRecalls = knownIssues?.recallCount || 0;
+  const ackSet = new Set(recallAcks);
+  // `campaigns` is absent on a last-good extApiCache payload written before this
+  // change shipped; without the campaign list we can't match, so we leave the
+  // count alone rather than guess. It self-heals on the next successful NHTSA pull.
+  const canMatchRecalls = Array.isArray(knownIssues?.campaigns);
+  const openRecalls = canMatchRecalls
+    ? knownIssues.campaigns.filter((c) => !ackSet.has(normCampaign(c))).length
+    : totalRecalls;
+  const repairedRecalls = totalRecalls - openRecalls;
+  if (repairedRecalls > 0) {
+    console.log(`🔧 ${repairedRecalls}/${totalRecalls} recall(s) marked repaired by the owner — ${openRecalls} open`);
+  }
 
   // No-data guard: if we couldn't identify the vehicle (no year/make/model from
   // VD or NHTSA) AND have no title record, no sales history, and no inspection,
@@ -557,18 +598,12 @@ export const handler = async (event) => {
     });
   }
 
-  // Sales history (surface the VD sales history we already fetched). Market value
-  // is resolved above in the parallel block (same source as the Garage's "Market
-  // Price Guide", monthly-cached with history).
-  const salesHistory = (sales?.entries || []).slice(0, 50).map((e) => ({
-    date: e.date ? String(e.date).slice(0, 10) : null,
-    location: [e.city, e.state].filter(Boolean).join(", ") || null,
-    price: e.listingPrice || null,
-    currency: e.currency || "USD",
-    odometer: e.odometerMi || null,
-    sellerType: e.sellerType || null,
-    damage: [e.primaryDamage, e.secondaryDamage].filter(Boolean).join("; ") || null,
-  }));
+  // Sales/listing history is NOT surfaced in the report (July 2026): an owner reported
+  // the vendor's timeline as inaccurate for their vehicle, so we no longer publish it as
+  // fact. `sales` is still used internally above — identity (year/make/model), the
+  // odometer fallback, and the FEMA flood location match — just not shown or counted.
+  // Market value is resolved in the parallel block above (same source as the Garage's
+  // "Market Price Guide", monthly-cached with history).
 
   // User-uploaded service records (garage). ALL records for the VIN, summary-only,
   // with near-duplicate uploads collapsed (same date+mileage+fuzzy summary).
@@ -590,7 +625,6 @@ export const handler = async (event) => {
   const have = ["Title", "History", "Flood", "Theft"];
   if (knownIssues) have.push("Recalls", "Known issues");
   if (inspection) have.push("Walkaround");
-  if (salesHistory.length) have.push("Sales history");
   if (serviceHistory.length) have.push("Service history");
   if (marketValue) have.push("Market value");
   const signals = {
@@ -603,14 +637,16 @@ export const handler = async (event) => {
     // checked=false means the title-brand source didn't respond (null) — summary
     // must NOT render that as a "Clean title" (false-clear); it shows "not verified".
     title: { checked: title != null, salvage: !!title?.salvage, floodBrand: flood.verdict === "FLOOD_TITLE", salvageDetails: Array.isArray(title?.salvage_details) ? title.salvage_details : [] },
-    flood: { verdict: flood.verdict },
+    flood: { verdict: flood.verdict, basis: flood.basis || null }, // basis drives the "area match ≠ damage" copy
     theft: { possibleStolen: !!stolen?.possibleStolen, checkedAt: stolen?.checkedAt || null, available: stolen != null },
-    recalls: { open: knownIssues?.recallCount || 0 }, // model-level; VIN-specific open status is a follow-up (VD recalls)
+    // model-level (VIN-specific open status is a follow-up, VD recalls), minus the
+    // ones the owner marked repaired in the garage. `open` drives both the category
+    // status/score and the "get N recalls fixed" action in summary.mjs.
+    recalls: { open: openRecalls, total: totalRecalls, repaired: repairedRecalls },
     knownIssues: {
       top: (knownIssues?.topIssues || []).map((i) => ({ component: i.component, count: i.count, addressed: false, severe: i.severe })),
     },
     inspection, // AI walkaround (ZoooomVideoInspect) when present, else null
-    salesHistory, // VD sales/listing history timeline
     marketValue, // garage Market Price Guide (monthly-cached, history kept)
     salesTax: { table: buildTaxTable(), defaultStateCode: state }, // buyer DMV tax (per-state, universal reference)
     // User-uploaded service records for the VIN (summary-only; images stay gated in the garage).
@@ -635,16 +671,20 @@ export const handler = async (event) => {
   const sourcesChecked = [
     { name: "Title brand & salvage", provider: "Vehicle Databases", status: title != null ? "checked" : "unavailable", lastRetrieved: gen },
     { name: "Theft / stolen record", provider: "Vehicle Databases", status: stolen != null ? "checked" : "pending", lastRetrieved: stolen?.checkedAt || null },
-    { name: "Sales & listing history", provider: "Vehicle Databases", status: sales != null ? "checked" : "unavailable", lastRetrieved: gen },
+    // "Sales & listing history" is intentionally absent — we no longer publish that
+    // timeline (owner-reported inaccuracy), so we don't claim it as a report source.
     { name: "Open recalls & known issues", provider: "NHTSA", status: knownIssues != null ? "checked" : "unavailable", lastRetrieved: gen },
     { name: "Flood risk", provider: "FEMA", status: flood ? "checked" : "unavailable", lastRetrieved: gen },
     { name: "Market value", provider: "Zoooom Market Price Guide", status: marketValue != null ? "checked" : "unavailable", lastRetrieved: marketValue?.asOf || gen },
     { name: "AI walkaround inspection", provider: "Zoooom", status: inspection != null ? "checked" : "not provided", lastRetrieved: inspection ? gen : null },
   ];
+  // Sales/listing entries no longer count — we don't show them, so we don't claim them.
+  // Recalls count in FULL here (totalRecalls, not openRecalls): this is "how many
+  // records we found for this VIN", i.e. evidence of coverage. A repaired recall is
+  // still a record we retrieved — it just isn't an OPEN one.
   const recordsFound =
-    (salesHistory?.length || 0) +
     (Array.isArray(stolen?.records) ? stolen.records.length : 0) +
-    (knownIssues?.recallCount || 0) +
+    totalRecalls +
     ((knownIssues?.topIssues || []).length) +
     (title?.salvage ? 1 : 0) +
     (inspection ? 1 : 0);
@@ -662,11 +702,18 @@ export const handler = async (event) => {
   //    each caller sees, so a preview request still warms the cache for later logins.
   if (docClient && REPORTS_TABLE) {
     try {
-      // mileageUsed is what the cache gate above compares against, so a later
-      // odometer change (relist, garage edit) rebuilds instead of serving stale.
+      // mileageUsed / recallAcksUsed are what the cache gate above compares against,
+      // so a later odometer change (relist, garage edit) or a newly checked-off
+      // recall rebuilds instead of serving stale.
       await docClient.send(new PutCommand({
         TableName: REPORTS_TABLE,
-        Item: { vin, report: summary, generatedAt: summary.generatedAt, mileageUsed: ownerMileage ?? null },
+        Item: {
+          vin,
+          report: summary,
+          generatedAt: summary.generatedAt,
+          mileageUsed: ownerMileage ?? null,
+          recallAcksUsed: recallAcksKey,
+        },
       }));
     } catch (e) {
       console.warn("⚠️ Report cache write failed:", e.message);

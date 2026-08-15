@@ -50,12 +50,16 @@ export function buildSummary(s) {
   );
 
   // --- Flood ---
+  // Flood risk is a LOCATION signal, not a damage finding: it matches where/when this
+  // VIN was recorded against FEMA disaster declarations. Only a branded title proves
+  // actual water damage — so every state carries `more` spelling that out (owner
+  // feedback, July 2026: readers took an area match to mean the car was flooded).
   cats.push(
-    s.flood?.verdict === "FLOOD_TITLE" || s.flood?.verdict === "HIGH"
-      ? cat("flood", "Flood risk", "serious", floodMsg(s.flood))
-      : s.flood?.verdict === "MEDIUM"
-      ? cat("flood", "Flood risk", "caution", "Was listed in a flood-disaster county — unconfirmed.")
-      : cat("flood", "Flood risk", "clear", "No flood title and no flood-zone match.")
+    s.flood?.verdict === "FLOOD_TITLE"
+      ? cat("flood", "Flood risk", "serious", "Branded flood title — water damage recorded on the title itself.", floodExtra(s.flood))
+      : s.flood?.verdict === "HIGH" || s.flood?.verdict === "MEDIUM"
+      ? cat("flood", "Flood risk", s.flood.verdict === "HIGH" ? "serious" : "caution", floodMsg(s.flood), floodExtra(s.flood))
+      : cat("flood", "Flood risk", "clear", "No flood brand on the title and no flood-disaster area match.", floodExtra(s.flood))
   );
 
   // --- Theft ---
@@ -70,10 +74,21 @@ export function buildSummary(s) {
   );
 
   // --- Open recalls (VIN-specific) ---
+  // `repaired` = campaigns the OWNER checked off in their garage. That's a self-
+  // reported claim, not a dealer record, so when it's what cleared this category we
+  // SAY so rather than showing a bare "No open recalls" — same honesty rule as the
+  // title check above (never present an unverified clear as a verified one).
   const open = s.recalls?.open || 0;
+  const repaired = s.recalls?.repaired || 0;
   cats.push(
     open > 0
-      ? cat("recalls", "Open recalls", "caution", `${open} open recall${open > 1 ? "s" : ""} — often a FREE dealer fix.`, { count: open })
+      ? cat("recalls", "Open recalls", "caution",
+          `${open} open recall${open > 1 ? "s" : ""} — often a FREE dealer fix.`,
+          { count: open, ...(repaired ? { repaired } : {}) })
+      : repaired > 0
+      ? cat("recalls", "Open recalls", "clear",
+          `No open recalls — the owner marked ${repaired === 1 ? "the recall" : `all ${repaired} recalls`} repaired. Owner-reported; ask for the dealer repair receipt.`,
+          { repaired, ownerReported: true })
       : cat("recalls", "Open recalls", "clear", "No open recalls.")
   );
 
@@ -147,10 +162,28 @@ export function buildSummary(s) {
     mileage: s.mileage,
     headline,
     categories: cats,
+    // AI walkaround condition DETAIL — the individual findings the AI saw, so the
+    // report can show a real "visible damage" list (not just a count). Gated: the
+    // locked preview strips this (see preview.mjs), same as other detail.
+    walkaround: s.inspection
+      ? {
+          exteriorDamage: (s.inspection.exteriorDamage || []).map((d) => ({
+            location: d.location, type: d.type, severity: d.severity,
+          })),
+          floodIndicators: (s.inspection.floodIndicators || []).map((f) => ({
+            indicator: f.indicator, where: f.where, confidence: f.confidence,
+          })),
+          conditionScore: Number.isFinite(s.inspection.overallConditionScore)
+            ? s.inspection.overallConditionScore : null,
+        }
+      : null,
     actions: buildActions(s, cats),
     reminderAvailable: !hasRecords, // drives the "upload records → service reminders" callout
     titleTransfer: titleTransferFor(s), // state smog + transfer overview (Zoooom doesn't do transfers)
-    salesHistory: s.salesHistory || null, // listing/auction history timeline
+    // NOTE: sales/listing history is deliberately NOT surfaced (July 2026) — an owner
+    // reported the vendor timeline as inaccurate for their vehicle. The raw entries are
+    // still used internally (flood location matching, identity, odometer fallback) but
+    // we don't publish them as fact.
     serviceHistory: s.serviceHistory || null, // user-uploaded service records (summary-only; images gated in garage)
     marketValue: s.marketValue || null, // garage Market Price Guide (only when mileage available)
     salesTax: s.salesTax || null, // per-state buyer DMV tax + selector default
@@ -218,14 +251,18 @@ function buildActions(s, cats) {
   const a = [];
   if (s.theft?.possibleStolen) a.push(act(1, "Verify the theft record before buying", "A possible stolen record was found. Do not transact until cleared.", "Verify", "verify_theft", NICB_VINCHECK));
   if (cats.find((c) => c.key === "flood" && c.status === "serious"))
-    a.push(act(1, "Treat as possible flood vehicle", "Flood title or strong flood-zone match. Get an independent inspection focused on electronics and corrosion.", "Get inspection", "get_inspection", GUIDE_INSPECT));
+    a.push(act(1, "Treat as possible flood vehicle",
+      s.flood?.basis === "title"
+        ? "The title itself carries a flood brand — water damage is on record. Get an independent inspection focused on electronics and corrosion before you buy."
+        : "This is an area/history match, not confirmed damage — the title check is what records real flood damage. Confirm the title brand and get an independent inspection focused on electronics and corrosion.",
+      "Get inspection", "get_inspection", GUIDE_INSPECT));
   if (s.title?.salvage && !s.title?.floodBrand)
     a.push(act(2, "Verify the salvage / branded title", "This car has a salvage (branded) title. Get an independent inspection focused on structural and safety repairs, and confirm it was properly re-titled (e.g. rebuilt) before you buy.", "Get inspection", "get_inspection", GUIDE_INSPECT));
   if ((s.recalls?.open || 0) > 0)
-    a.push(act(2, `Get ${s.recalls.open} open recall${s.recalls.open > 1 ? "s" : ""} fixed`, "Open safety recalls are usually repaired free at a dealer.", "Find dealer", "find_dealer", NHTSA_RECALLS));
+    a.push(act(2, `Get ${s.recalls.open} open recall${s.recalls.open > 1 ? "s" : ""} fixed`, "Open safety recalls are usually repaired free at a dealer — look up the specific recall by VIN at NHTSA.", "Look up the recall", "find_dealer", NHTSA_RECALLS));
   const watch = (s.knownIssues?.top || []).filter((i) => !i.addressed)[0];
   if (watch)
-    a.push(act(3, `Have the ${titleCase(watch.component).toLowerCase()} checked`, `It's this model's most-reported issue (${watch.count} owner reports) and isn't in the service history.`, "Why this matters", "why_matters", GUIDE_INSPECT));
+    a.push(act(3, `Have the ${titleCase(watch.component).toLowerCase()} checked`, `It's this model's most-reported issue (${watch.count} owner reports) and isn't in the service history.`, "How to check it", "why_matters", GUIDE_INSPECT));
   if ((s.maintenance?.milesOverdue || 0) > 5000)
     a.push(act(4, "Catch up on maintenance", `Service looks ~${s.maintenance.milesOverdue.toLocaleString()} mi overdue.`, "Upload records", "upload_records"));
   else if (!s.maintenance || s.maintenance.noRecords)
@@ -237,6 +274,56 @@ function buildActions(s, cats) {
 
 const act = (priority, title, why, cta, action, href) => ({ priority, title, why, cta, action, href });
 const titleCase = (s) => (s || "").toLowerCase().replace(/\b\w/g, (m) => m.toUpperCase());
+// One-line flood detail. Never claims damage unless it came from the title brand.
 const floodMsg = (f) =>
-  f.verdict === "FLOOD_TITLE" ? "Branded flood title — confirmed water damage on record." : "Strong flood-zone match for this VIN's history.";
+  f?.basis === "disclosure"
+    ? "Water damage was noted in a past listing/auction record for this VIN — it is not a title brand."
+    : f?.verdict === "HIGH"
+    ? "This VIN was in an area under a federal flood-disaster declaration that caused household damage — an area match, not confirmed damage to this car."
+    : "This VIN was in a county under a federal flood-disaster declaration around that time — an area match, not confirmed damage to this car.";
+
+// The expandable explainer under "Flood risk". Says plainly what the signal is,
+// what it is NOT, and points at the Title check as the record of real flood damage.
+const FLOOD_HOW =
+  "How to read this: flood risk is a LOCATION signal. We take where and when this VIN " +
+  "shows up in its history and match it against FEMA federal disaster declarations for " +
+  "floods, hurricanes and tropical storms. A match means the car was in an area a flood " +
+  "was declared in — it does NOT mean this car took on water. Most vehicles in a declared " +
+  "county are never damaged. Actual flood damage is normally recorded as a branded " +
+  "(flood or salvage) title, so the Title check above is the record to go by. Treat a " +
+  "flood-risk match as a reason to look closer: confirm the title brand, and have an " +
+  "inspection focused on corrosion, silt under the carpet, a damp/musty smell and " +
+  "electrical faults.";
+
+function floodExtra(f) {
+  const src = "FEMA disaster declarations · title-brand check";
+  if (f?.basis === "title") {
+    return {
+      src: "Title-brand check (Vehicle Databases)",
+      more:
+        "This one IS confirmed. It comes from the title-brand check, not from location: " +
+        "an insurer or DMV recorded flood/water damage against this VIN, so the damage is " +
+        "documented rather than inferred. See the Title row above for the recorded cause and " +
+        "date, and treat the car as a flood vehicle unless a mechanic proves otherwise.",
+    };
+  }
+  if (f?.basis === "disclosure") {
+    return {
+      src: "Vehicle history records (Vehicle Databases) · title-brand check",
+      more:
+        "This came from a damage field on a past listing or auction record for this VIN — " +
+        "a seller/auction disclosure, not a title brand. It has not been confirmed by a " +
+        "title authority. " + FLOOD_HOW,
+    };
+  }
+  if (f?.verdict === "HIGH" || f?.verdict === "MEDIUM") return { src, more: FLOOD_HOW };
+  // Clear: explain what we actually ruled out, so "clear" isn't read as more than it is.
+  return {
+    src,
+    more:
+      "We found no flood or water brand on this VIN's title, and no match between where " +
+      "this VIN has been recorded and FEMA's federal flood-disaster declarations. " +
+      FLOOD_HOW,
+  };
+}
 

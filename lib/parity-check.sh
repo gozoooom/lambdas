@@ -38,7 +38,7 @@ JSON=""; ARGS=()
 for a in "$@"; do case "$a" in --json) JSON=1;; *) ARGS+=("$a");; esac; done
 
 python3 - "$JSON" "${ARGS[@]+"${ARGS[@]}"}" <<'PY'
-import boto3, re, sys, json
+import boto3, re, sys, json, os
 JSON = bool(sys.argv[1])
 names = sys.argv[2:]
 L = boto3.client("lambda")
@@ -82,41 +82,61 @@ def cross_wired(vals, want):
                    for got in re.findall(r'_(dev|staging|prod)\b', v) if got != want})
 
 fails, warns = [], []
+# Coverage accounting. A gate that silently excludes most of its population
+# provides FALSE ASSURANCE, which is worse than no gate at all. Previously this
+# script required all three aliases to be present and skipped the function
+# otherwise — only 1 of 42 internal lambdas has all three, so 41 were never
+# checked while the gate reported success. Now we compare whatever aliases
+# exist, and report exactly what was and was not covered.
+cov = {"compared": [], "cross_wire_only": [], "no_alias": []}
+
 for fn in names:
     try:
         al = {a["Name"].lower(): a["Name"] for a in L.list_aliases(FunctionName=fn)["Aliases"]}
     except Exception:
         continue
-    if not all(e in al for e in ENVS):
+
+    envs = [e for e in ENVS if e in al]          # aliases this function ACTUALLY has
+    if not envs:
+        cov["no_alias"].append(fn)
         continue
     try:
-        c = {e: cfg(fn, al[e]) for e in ENVS}
+        c = {e: cfg(fn, al[e]) for e in envs}
     except Exception as ex:
         warns.append((fn, "fetch", str(ex))); continue
 
-    # code
-    if len({c[e]["sha"] for e in ENVS}) > 1 and not allowed(fn, "code"):
-        warns.append((fn, "code", "CodeSha256 differs: " + ", ".join(f"{e}={c[e]['sha'][:8]}" for e in ENVS)))
-    # config (hard)
-    for dim in ("to", "rt", "mem"):
-        if len({str(c[e][dim]) for e in ENVS}) > 1 and not allowed(fn, "config"):
-            fails.append((fn, "config", f"{dim}: " + ", ".join(f"{e}={c[e][dim]}" for e in ENVS)))
-    # env keys (hard) — keys only, never values
-    keys = {e: set(c[e]["env"]) for e in ENVS}
-    allk = set().union(*keys.values())
-    missing = {k: [e for e in ENVS if k not in keys[e]] for k in allk}
-    missing = {k: v for k, v in missing.items() if v}
-    if missing and not allowed(fn, "env"):
-        for k, envs in sorted(missing.items()):
-            fails.append((fn, "env-key", f"'{k}' missing on {','.join(envs)}"))
-    # cross-wire (hard)
-    for e in ENVS:
+    # cross-wire (hard) — per-env, needs no comparison, so it runs on ANY
+    # function with at least one alias. This is the highest-severity check and
+    # it is precisely the one the old skip condition was suppressing.
+    for e in envs:
         bad = cross_wired(c[e]["env"], e)
         if bad:
             fails.append((fn, "cross-wire", f"{e} env keys point at another env: {','.join(bad)}"))
-    # version ordering (warn)
+
+    if len(envs) < 2:
+        cov["cross_wire_only"].append(f"{fn}[{','.join(envs)}]")
+        continue                                  # nothing to compare against
+
+    cov["compared"].append(f"{fn}[{','.join(envs)}]")
+
+    # code
+    if len({c[e]["sha"] for e in envs}) > 1 and not allowed(fn, "code"):
+        warns.append((fn, "code", "CodeSha256 differs: " + ", ".join(f"{e}={c[e]['sha'][:8]}" for e in envs)))
+    # config (hard)
+    for dim in ("to", "rt", "mem"):
+        if len({str(c[e][dim]) for e in envs}) > 1 and not allowed(fn, "config"):
+            fails.append((fn, "config", f"{dim}: " + ", ".join(f"{e}={c[e][dim]}" for e in envs)))
+    # env keys (hard) — keys only, never values
+    keys = {e: set(c[e]["env"]) for e in envs}
+    allk = set().union(*keys.values())
+    missing = {k: [e for e in envs if k not in keys[e]] for k in allk}
+    missing = {k: v for k, v in missing.items() if v}
+    if missing and not allowed(fn, "env"):
+        for k, menvs in sorted(missing.items()):
+            fails.append((fn, "env-key", f"'{k}' missing on {','.join(menvs)}"))
+    # version ordering (warn) — only when both sides exist
     def n(v): return -1 if v == "$LATEST" else int(v)
-    if n(c["staging"]["ver"]) > n(c["prod"]["ver"]):
+    if "staging" in envs and "prod" in envs and n(c["staging"]["ver"]) > n(c["prod"]["ver"]):
         warns.append((fn, "version", f"staging v{c['staging']['ver']} > prod v{c['prod']['ver']}"))
 
 # ── Gateway route parity (once) ────────────────────────────────────────────
@@ -162,9 +182,30 @@ except Exception as ex:
     warns.append(("<cron>", "error", str(ex)))
 
 if JSON:
-    print(json.dumps({"fails": fails, "warns": warns}, indent=2)); sys.exit(1 if fails else 0)
+    print(json.dumps({"fails": fails, "warns": warns, "coverage": {
+        "considered": len(names),
+        "compared": len(cov["compared"]),
+        "cross_wire_only": len(cov["cross_wire_only"]),
+        "no_alias": len(cov["no_alias"]),
+        "cross_wire_only_fns": cov["cross_wire_only"],
+        "no_alias_fns": cov["no_alias"],
+    }}, indent=2)); sys.exit(1 if fails else 0)
 
 print(f"── parity-check: {len(names)} functions considered\n")
+
+# ── Coverage (never let this gate pass silently on a partial population) ──
+_tot = len(names)
+_cmp, _cwo, _na = len(cov["compared"]), len(cov["cross_wire_only"]), len(cov["no_alias"])
+_pct = (100.0 * _cmp / _tot) if _tot else 0.0
+print(f"── coverage: {_cmp}/{_tot} ({_pct:.0f}%) fully compared across >=2 aliases")
+if _cwo:
+    print(f"             {_cwo} checked for cross-wiring only (single alias)")
+if _na:
+    print(f"             {_na} NOT CHECKED (no dev/staging/prod alias at all)")
+if os.environ.get("PARITY_COVERAGE_DETAIL"):
+    for f in cov["cross_wire_only"]: print(f"               single-alias: {f}")
+    for f in cov["no_alias"]:        print(f"               no-alias:     {f}")
+print()
 if fails:
     print(f"✗ {len(fails)} HARD FAILURE(S) (block promotion):")
     for fn, cat, msg in fails: print(f"   ✗ [{cat}] {fn}: {msg}")

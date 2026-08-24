@@ -29,8 +29,8 @@
 # serve both correctly.
 set -euo pipefail
 
-FN="${1:?usage: promote.sh <FunctionName> <Staging|Prod> [--yes] [--set KEY=VALUE]...}"
-TARGET="${2:?usage: promote.sh <FunctionName> <Staging|Prod> [--yes] [--set KEY=VALUE]...}"
+FN="${1:?usage: promote.sh <FunctionName> <Staging|Prod> [--yes] [--set KEY=VALUE]... [--unset KEY]...}"
+TARGET="${2:?usage: promote.sh <FunctionName> <Staging|Prod> [--yes] [--set KEY=VALUE]... [--unset KEY]...}"
 shift 2
 REGION="${AWS_REGION:-us-west-2}"
 
@@ -39,8 +39,14 @@ REGION="${AWS_REGION:-us-west-2}"
 # the alias env is the source of truth, so a brand-new key cannot come from there.
 # Values still go through the cross-wire guard below, so a `_dev` value aimed at
 # Prod is still rejected. Use ONLY for genuinely new keys; never to "fix" drift.
+# --unset KEY (repeatable) REMOVES a variable from the TARGET env for this
+# promote. Needed to retire a variable that is no longer read — e.g. a plaintext
+# credential superseded by a Secrets Manager pointer. The alias env is the source
+# of truth and is otherwise inherited verbatim, so without this there is no way
+# to drop a key without hand-editing a published version.
 ASSUME_YES=""
 EXTRA_JSON="{}"
+UNSET_JSON="[]"
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes) ASSUME_YES="--yes"; shift ;;
@@ -50,6 +56,13 @@ while [ $# -gt 0 ]; do
       EXTRA_JSON=$(python3 -c "
 import json,sys
 d=json.loads(sys.argv[1]); k,_,v=sys.argv[2].partition('='); d[k]=v; print(json.dumps(d))" "$EXTRA_JSON" "$KV")
+      shift 2 ;;
+    --unset)
+      K="${2:?--unset needs KEY}"
+      case "$K" in *=*) echo "ABORT: --unset expects KEY, not KEY=VALUE (got '$K')"; exit 1 ;; esac
+      UNSET_JSON=$(python3 -c "
+import json,sys
+l=json.loads(sys.argv[1]); l.append(sys.argv[2]); print(json.dumps(l))" "$UNSET_JSON" "$K")
       shift 2 ;;
     *) echo "ABORT: unknown arg '$1'"; exit 1 ;;
   esac
@@ -104,6 +117,21 @@ base=json.loads(sys.argv[1]); extra=json.loads(sys.argv[2])
 for k,v in extra.items():
     print(f'   --set {k}={v}' + ('  (overrides existing)' if k in base else '  (new key)'), file=sys.stderr)
 base.update(extra); print(json.dumps(base))" "$TARGET_ENV_JSON" "$EXTRA_JSON")
+fi
+
+# Apply --unset AFTER --set, so `--set K=v --unset K` unambiguously removes K.
+# Removal happens before the cross-wire guard, so dropping a key can also clear a
+# pre-existing cross-wire violation rather than being blocked by it.
+if [ "$UNSET_JSON" != "[]" ]; then
+  TARGET_ENV_JSON=$(python3 -c "
+import json,sys
+base=json.loads(sys.argv[1]); keys=json.loads(sys.argv[2])
+for k in keys:
+    if k in base:
+        print(f'   --unset {k}  (removing)', file=sys.stderr); base.pop(k)
+    else:
+        print(f'   --unset {k}  (not present on target - no-op)', file=sys.stderr)
+print(json.dumps(base))" "$TARGET_ENV_JSON" "$UNSET_JSON")
 fi
 
 # ── 3. Refuse to promote if the target's OWN env is already cross-wired ────────
